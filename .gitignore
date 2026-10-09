@@ -1,0 +1,27 @@
+# Meson / Ninja build directories
+/build/
+/build-*/
+/builddir/
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Compiler / linker output
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.gcda
+*.gcno
+*.gcov
+
+# Tooling
+compile_commands.json
+/.cache/
+/.vscode/
+/.idea/
+*.swp
+*~
+core.[0-9]*
+vgcore.*
