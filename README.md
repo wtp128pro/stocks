@@ -51,12 +51,14 @@ gray area; it is meant for personal, low-volume use only, and you should
 check Yahoo's terms before using it for anything else. To stay polite the Yahoo
 provider makes at most one request at a time and starts requests at least 3 s
 apart, and the app fetches the indices one at a time, using at most one of its
-4 request slots (see "Refresh policy"), so the other symbols are never held
-back by them; a full refresh of the indices takes at least about 3 s per
-index job. Yahoo may throttle (HTTP 429, not retried) or break this
-endpoint at any time, or be slow or unreachable; then only the index rows go
-stale (cached data is kept) while the Nasdaq-backed symbols refresh on their
-normal schedule. Index quotes are not guaranteed to be
+4 request slots (see "Refresh policy"). While an index request is
+outstanding it takes 1 of the 4 slots, so the Nasdaq-backed symbols share the
+other 3: they may start later, but are never starved. A full refresh of the
+indices takes at least about 3 s per index job. Yahoo may throttle (HTTP 429,
+not retried) or break this endpoint at any time, or be slow or unreachable;
+then only the index rows go stale (cached data is kept) while the
+Nasdaq-backed symbols keep refreshing, with 3 slots while an index request is
+outstanding. Index quotes are not guaranteed to be
 real-time, and the symbol search in the Add window only searches Nasdaq (the
 indices are found in the catalog, filter "Indices").
 
@@ -121,6 +123,156 @@ another one with `meson setup --prefix=... build`). It installs the binary,
 the desktop entry, the metainfo file and the two icons under the prefix; it
 does not refresh icon or desktop-entry caches.
 
+### Makefile
+
+The `Makefile` at the repository root is a thin wrapper over Meson and Ninja,
+for convenience; Meson remains the build system. It needs **GNU make** (3.82
+or newer, not BSD make) and no other dependency. `make` alone prints the help.
+The `Makefile` exists on `main` only: it is not in the v0.1.0 tarball and not
+part of the published RPMs.
+
+| Target | What it does |
+| --- | --- |
+| `make help` | The default target: the list of targets and the current variables. |
+| `make build` (alias `make all`) | `meson setup $(BUILDDIR)` if that is not yet a Meson build directory, then `meson compile`. Always compiles, even though `build/` exists. This is the development build (the project default, `debugoptimized`). |
+| `make test` | `meson test` in `$(BUILDDIR)` with `DISPLAY` and `WAYLAND_DISPLAY` unset and `GTK_IM_MODULE=simple GTK_A11Y=none`, so `chart-widget` and `picker` report SKIP and nothing can open a window on your desktop. |
+| `make check` | The whole suite, GUI tests included, in `$(BUILDDIR)`: inside `unshare -rmn sh -c 'ip link set lo up && mount -t tmpfs tmpfs /tmp && ...'` (private `/tmp`, loopback only) under `xvfb-run -a`, with the same two environment variables. Safe on a desktop; refuses a checkout or `BUILDDIR` under `/tmp`. |
+| `make release` | Configures `$(RELEASE_BUILDDIR)` as a release build (`--buildtype=release -Ddebug=false -Doptimization=3`, other options reset, `--prefix=$(PREFIX)`), on every run, also on an existing directory, verifies the result, then compiles. Never reads or writes `$(BUILDDIR)`. Refuses to run as root. |
+| `make install` | `make release`, then a verified scratch install (5 files, modes, stripped binary), then `meson install --strip` (plus `--destdir` when `DESTDIR` is set) and, only when `DESTDIR` is empty, the cache refresh below. Refuses a `PREFIX` you cannot write; never uses `sudo`. |
+| `make uninstall` | Deletes the files listed in `$(RELEASE_BUILDDIR)/meson-logs/install-log.txt` (no Meson, no Ninja, no rebuild), prunes the directories that became empty inside the prefix, then the same cache refresh. |
+| `make rpm` | Source and binary RPMs of git `HEAD` (tarball, spec and version all from `HEAD`) in the isolated form of "Packaging notes"; prints the RPM paths; does not run `rpmlint`. |
+| `make clean` | Removes `$(BUILDDIR)`. |
+| `make distclean` | Removes `$(BUILDDIR)`, `$(RELEASE_BUILDDIR)` and `$(RPMTOP)`. |
+
+Variables, all overridable on the command line (`make install PREFIX=$HOME/stocks-test`):
+
+| Variable | Default | Used by |
+| --- | --- | --- |
+| `PREFIX` | `$(HOME)/.local` (absolute, not `/`; install needs a prefix you can write) | `release`, `install`, `uninstall` |
+| `BUILDDIR` | `build` (must not start with `-`) | `build`, `test`, `check`, `clean`, `distclean` |
+| `RELEASE_BUILDDIR` | `build-release` (must not start with `-`) | `release`, `install`, `uninstall`, `distclean` |
+| `DESTDIR` | empty | `install`, `uninstall` |
+| `RPMTOP` | `$(HOME)/.cache/stocks-rpmbuild` (absolute; plain characters only, see `make rpm`) | `rpm`, `distclean` |
+
+- **Release, stripped install.** `make install` installs a **release** build,
+  never the development one: it builds in its own directory
+  (`RELEASE_BUILDDIR`, ignored by `.gitignore` as `/build-*/`). On every run,
+  also on an existing directory, `make release` passes `--buildtype=release
+  -Ddebug=false -Doptimization=3 -Db_ndebug=false -Db_lto=false
+  -Db_sanitize=none -Db_coverage=false -Db_pgo=off -Dinstall_umask=022
+  -Dbindir=bin -Ddatadir=share -Dwrap_mode=nodownload` and the normalised
+  `--prefix` to `meson setup` (`--reconfigure` when the directory exists) with
+  `STRIP` unset, then reads `meson introspect --buildoptions` back and stops
+  if the buildtype is not `release`, `debug` is not false, `optimization` is
+  not 3, any of the other options differs, the prefix is not the requested
+  one, or `c_args` / `c_link_args` hold a `-g*` or `-O*` flag (for example
+  from `CFLAGS` at the first configure; other flags in them are left alone;
+  fix it with `meson configure -Dc_args= build-release`). A `build-release`
+  that was configured with `-Ddebug=true`, `-Doptimization=0`,
+  `-Db_lto=true`, `-Db_ndebug=true`, a sanitizer, another buildtype, another
+  `install_umask`, an absolute `bindir` / `datadir` (from `meson configure`
+  or a native file) or another prefix is therefore brought back to `-O3`
+  without `-g`, permissions 0755/0644 and the install directories under the
+  prefix. `b_ndebug=false` keeps the asserts enabled, as in the project's
+  release buildtype and in the test runs, so "release" here means `-O3`, no
+  debug information, no LTO, no sanitizer. The install is
+  `meson install --strip`, and it is verified, not trusted: it is first made
+  into a scratch `DESTDIR` (under `$TMPDIR`, removed afterwards), which must
+  contain exactly five regular files, all under the prefix (so an option that
+  redirects an install is caught, whatever sets it), `bin/stocks` with mode
+  0755 and the other four 0644, every directory 0755, and `bin/stocks` must
+  have no `.symtab` and no `.debug_*` section in `readelf -S` (`file` then
+  says "stripped"). If any of that fails, nothing is installed and the message
+  says why (for example a `strip` tool replaced through a native file). Only
+  then is the real install made, and its `bin/stocks` is checked again before
+  the success message, which claims "stripped" only after that. The install
+  log of an earlier install is put back after the scratch run. `strip` and
+  `readelf` (package `binutils`) are required. Exactly five files are
+  installed under the prefix: `bin/stocks` (mode 0755), the desktop entry, the
+  metainfo file and the two icons (0644). The project default
+  (`debugoptimized`, used by `build/`) is unchanged. The suite passes against
+  the release build too: `make release && make check BUILDDIR=build-release`
+  (the first command guarantees that `build-release` is a release build). Not
+  covered: tools and libraries picked up from your environment (`CC`,
+  `PKG_CONFIG_PATH`, `NINJA`, `LDFLAGS` without `-g`/`-O`, `-DNDEBUG` in
+  `CFLAGS`) are what you chose and are not second-guessed.
+- **Caches.** Only when `DESTDIR` is empty, `install` and `uninstall` refresh
+  the caches of `$(PREFIX)`: an `icon-theme.cache` that already exists in
+  `$(PREFIX)/share/icons/hicolor` is updated with `gtk4-update-icon-cache` (or
+  `gtk-update-icon-cache`) `-q -t -f`. A new one is never created: when there is
+  none, the directory `$(PREFIX)/share/icons/hicolor` is only `touch -c`ed (its
+  timestamp is bumped if it exists; nothing is created). `update-desktop-database`
+  runs on `$(PREFIX)/share/applications` if it is
+  installed (it writes `mimeinfo.cache` there, which `uninstall` leaves
+  behind). A missing or failing cache tool only prints a note.
+- **PATH.** The desktop entry says `Exec=stocks`, so `$(PREFIX)/bin`
+  (`~/.local/bin` by default) must be on the `PATH` of your session for the
+  launcher to find the binary. `make install` (without `DESTDIR`) prints a
+  note if it is not on the `PATH` of the shell that ran it. The comparison is
+  made after normalising both sides the same way (`realpath -m`: `//`, `.`,
+  `..` and symlinks resolved), so a symlinked prefix or `PATH` entry gives no
+  false note; empty and relative `PATH` entries are ignored. The note only
+  concerns that shell: your desktop session's `PATH` may differ.
+- **No sudo, no root.** The Makefile never calls `sudo`, and Meson cannot do
+  it on its behalf. `meson install` offers to re-run itself through `sudo`,
+  `doas`, `run0` or `pkexec` after a permission error when its output is a
+  terminal. `make install` therefore (1) refuses a `PREFIX` when the nearest
+  existing directory at or above it is not writable by you (for example
+  `/usr/local` or `/opt/stocks`), before invoking Meson, and (2) runs Meson
+  with its output captured in a temporary file that is printed afterwards, so
+  that a permission error deeper inside the prefix just fails. Use a prefix
+  you own, e.g. `make install PREFIX=$HOME/stocks-test`. `make release` (and
+  so `make install`) also refuses to run as root, so a `sudo make install`
+  cannot leave root-owned files in `build-release/`. For a system-wide
+  install use the RPM (built with `make rpm`, or the published one) and
+  `dnf`; the Makefile supports nothing else.
+- **Uninstall.** `make uninstall` is driven by the install log alone,
+  `$(RELEASE_BUILDDIR)/meson-logs/install-log.txt`: it runs neither Meson nor
+  Ninja, so it never reconfigures or rebuilds, leaves the release directory
+  unchanged (also when a `meson.build` is newer) and works even if the source
+  tree no longer configures. It fails with a message when the log is missing
+  or lists no files. The log holds only the **last** install: a later install
+  overwrites it, and a `DESTDIR` install overwrites it with the staged paths,
+  so remove a staged install with `make uninstall DESTDIR=... PREFIX=...`
+  using the same `DESTDIR` and `PREFIX`. The log is not trusted. `PREFIX` must
+  be an absolute path other than `/`; `PREFIX` and `DESTDIR` are normalised
+  (`//`, trailing `/`, symlinks resolved), and a logged path is acted on only
+  if it is absolute, has no `.` or `..` component and its parent directory
+  (symlinks resolved; a logged symlink itself is removed, never followed) lies
+  strictly inside `$(PREFIX)` (`$(DESTDIR)$(PREFIX)` for a staged install).
+  Every other entry is left alone, with a warning, and the target then exits
+  non-zero (for example a log from a `DESTDIR` install used without that
+  `DESTDIR`, or a different `PREFIX` than at install time; the directories
+  that the install created above the prefix are not warned about, only never
+  removed). After deleting, it walks up from each removed file and removes
+  parent directories that are now empty, but only strictly inside the prefix:
+  the prefix itself and every directory that still holds something (for
+  example `share/applications` with its `mimeinfo.cache`) stay. This holds
+  after repeated installs too. Run `make uninstall` **before**
+  `make distclean`, which deletes `$(RELEASE_BUILDDIR)` and with it the log.
+- **`make rpm`.** It reads the version from the spec and from `meson.build`
+  **as committed in `HEAD`** (`git show HEAD:...`), checks that they are equal,
+  and runs `git archive --prefix=stocks-<version>/ HEAD` into
+  `$(RPMTOP)/SOURCES/stocks-<version>.tar.gz`. The spec that `rpmbuild` gets is
+  the one from `HEAD` too, copied to `$(RPMTOP)/SPECS/stocks.spec`; it does not
+  run `rpmlint`. `RPMTOP` must be an absolute
+  path outside the checkout and not under `/tmp` (the build runs with a tmpfs
+  over `/tmp`; use e.g. a directory under `/var/tmp`). It may contain only
+  letters, digits and `. _ / + @ , = -`: `rpmbuild` expands it as an RPM macro
+  value, and one with whitespace, quotes, `%` or `$` would make it write
+  outside the topdir, so `make rpm` refuses such a path (and a `$HOME` with a
+  space in the default) before it creates anything. An existing `RPMTOP` must
+  be empty or made by an earlier `make rpm` (it holds a
+  `.stocks-rpmbuild-topdir` marker file). It builds `HEAD`, not the working
+  tree: uncommitted changes, including edits of the spec or `meson.build`, are
+  not packaged (the target says so), and commits made after the v0.1.0 tag are
+  built under the spec's version (0.1.0-1), so the result is not the published
+  v0.1.0 release.
+- **`clean` and `distclean`** refuse an empty value, `/`, `.`, the checkout
+  and `$HOME`, a build directory that has no `meson-private/coredata.dat` and
+  an `RPMTOP` without the marker file; a directory that does not exist is
+  skipped.
+
 ### Run
 
 ```sh
@@ -143,6 +295,11 @@ your real `ibus-daemon`, which makes typing bursts on your desktop. `meson
 test` without `xvfb-run` works only if a display is available; the test suites
 that open windows pin `GDK_BACKEND=x11`, so run them under `xvfb-run -a` to
 keep them off your real session. The picker suite takes about 20 s.
+
+`make check` (see "Makefile") runs the whole suite in that spirit, but inside a
+private user, mount and network namespace with its own `/tmp` and loopback, so
+Xvfb shares neither its sockets nor its lock files with your session; `make
+test` runs it with no display variable set, so the two GUI tests are skipped.
 
 The 13 tests are in the suites `core`, `provider`, `indices`, `storage`,
 `catalog`, `chart` (2 tests), `picker`, `ui` and `data` (4 tests). None needs
@@ -186,11 +343,14 @@ The decisions live in `src/ui/stk-scheduler.h` (pure logic, unit-tested in
   a request is queued).
 - Hiding the window or losing the network cancels requests in flight.
 - At most 4 requests are outstanding at once. Index symbols are fetched one at
-  a time and use at most one of those 4 slots: while an index request is
-  outstanding (even a slow or hanging one), the other index jobs wait and the
-  slots stay free for the Nasdaq-backed symbols. A slow or unreachable Yahoo
-  therefore leaves only the index rows stale; the Nasdaq-backed symbols
-  refresh on their normal schedule. A full refresh of the indices takes at
+  a time: at most one index request is outstanding, and it takes one of
+  those 4 slots. While it is outstanding (even a slow or hanging one), the
+  other index jobs wait, and the Nasdaq-backed symbols share the other 3
+  slots: they may start later than they would with all 4 slots free, but they
+  are never starved, because the index request holds only one slot. A slow or
+  unreachable Yahoo therefore leaves only the index rows stale, while the
+  Nasdaq-backed symbols keep refreshing, at most 3 at a time until that index
+  request finishes. A full refresh of the indices takes at
   least about 3 s per index job (the Yahoo provider starts requests at least
   3 s apart).
 - A failed request keeps the cached data, marks the symbol stale, and is retried
@@ -477,15 +637,17 @@ empty, negative) exits 2 immediately, before anything is started.
 - Quotes depend on the unofficial API (see above); a failed refresh shows
   the previous data dimmed, not an error dialog. Fidelity funds'
   NAV arrives once a day.
-- After-hours and pre-market behaviour of the provider is inferred in part.
-  The repository stores recorded provider responses only for after-hours
-  quotes (`src/provider/fixtures/quote_stock.json`, `quote_etf.json`, and the
-  1D chart `chart_1d_etf.json`) plus a fund quote, daily charts, a fund
-  history, a search and an error body. The open, closed and pre-market
-  layouts are exercised only by hand-written bodies in `test-nasdaq.c`.
-  `stk-nasdaq.h` says that real responses for Open, After-Hours and Closed
-  were seen and that Pre-Market is inferred; the Open and Closed ones are
-  not stored in the repository.
+- After-hours and pre-market behaviour of the Nasdaq provider is inferred in
+  part. For that provider the repository stores recorded responses only for
+  after-hours quotes (`src/provider/fixtures/quote_stock.json`,
+  `quote_etf.json`, and the 1D chart `chart_1d_etf.json`) plus a fund quote,
+  daily charts, a fund history, a search and an error body. The open, closed
+  and pre-market layouts are exercised only by hand-written bodies in
+  `test-nasdaq.c`. `stk-nasdaq.h` says that real responses for Open,
+  After-Hours and Closed were seen and that Pre-Market is inferred; the Open
+  and Closed ones are not stored in the repository. The Yahoo provider's
+  captured responses (market indices) are listed under "Data provenance and
+  trademarks"; this limit is about the Nasdaq provider only.
 - Market hours come from a built-in rule calendar for 2022-2100 (US NYSE
   holidays and early closes); outside it the market counts as closed.
 - Quitting while the start-up load is still running (the main window is only
@@ -525,6 +687,12 @@ project and are covered by the same licence as the program.
   supported public APIs, are meant for personal, low-volume use only, may
   change, throttle you or stop working at any time, and their terms of use
   are yours to check.
+- `src/provider/fixtures/` (Nasdaq API) and `src/indices/fixtures/` (Yahoo
+  chart endpoint: `chart_1d_index.json`, `chart_1y_index.json` and
+  `chart_error.json`) hold captured responses (the Yahoo ones trimmed) that
+  the unit tests (`test-nasdaq.c`, `test-indices.c`) read as offline inputs. Nothing reads
+  them at run time and `meson install` does not install them: they ship in the
+  source tarball and the source RPM, not in the binary RPM.
 - Stocks is not affiliated with, endorsed by or sponsored by Fidelity,
   Nasdaq, Yahoo or Apple. All company, fund, index and product names that
   appear in the app, in the data files or in this repository (for example
@@ -555,14 +723,24 @@ what a reviewer needs:
   file, the two icons, `%license COPYING` and `%doc README.md`.
 
 Build the source and binary RPMs from a checkout (the tarball must contain the
-tag's tree, so commit and tag first):
+tag's tree, so commit and tag first). The topdir is outside the checkout and
+not under `/tmp`, and the whole build, `%check` included, runs in a private
+user, mount and network namespace (explained below):
 
 ```sh
-git archive --prefix=stocks-0.1.0/ -o stocks-0.1.0.tar.gz HEAD
-mkdir -p rpmbuild/SOURCES && mv stocks-0.1.0.tar.gz rpmbuild/SOURCES/
-rpmbuild -ba --define "_topdir $PWD/rpmbuild" packaging/rpm/stocks.spec
-rpmlint packaging/rpm/stocks.spec rpmbuild/RPMS/*/stocks-*.rpm rpmbuild/SRPMS/stocks-*.src.rpm
+top=/var/tmp/stocks-rpmbuild
+mkdir -p "$top/SOURCES"
+git archive --prefix=stocks-0.1.0/ -o "$top/SOURCES/stocks-0.1.0.tar.gz" HEAD
+unshare -rmn sh -c 'ip link set lo up && mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $1" packaging/rpm/stocks.spec' sh "$top"
+rpmlint packaging/rpm/stocks.spec "$top"/RPMS/*/stocks-*.rpm "$top"/SRPMS/stocks-*.src.rpm
 ```
+
+`make rpm` (see "Makefile") does the same, with its own checks, except that it
+takes the spec file and the version from `HEAD` (not the working tree) and does
+**not** run `rpmlint`: run the last command above on the paths it prints. As in
+this recipe, the topdir must be a plain path (letters, digits and
+`. _ / + @ , = -` only): `rpmbuild` expands it as an RPM macro value, and a
+topdir with whitespace, quotes, `%` or `$` makes it write outside the topdir.
 
 `rpmbuild/`, `*.rpm` and `*.tar.gz` are in `.gitignore`. `%check` runs, in
 this order, `desktop-file-validate` on the installed desktop entry,
@@ -576,18 +754,26 @@ available, so without Xvfb the build would silently test less.
 `GTK_IM_MODULE=simple` keeps the test processes from connecting to an
 input-method daemon.
 
-`xvfb-run` creates its X socket in `/tmp/.X11-unix` and a lock file
-`/tmp/.X<n>-lock`, the same places a desktop session on that machine uses. A
-plain mount namespace (`unshare -rm rpmbuild ...`) does **not** change that: it
-shares the host's `/tmp` until something is mounted over it. On a desktop
-machine, give the build a private `/tmp` instead:
+`xvfb-run` creates its X socket in `/tmp/.X11-unix`, a lock file
+`/tmp/.X<n>-lock` and an abstract socket, the same places a desktop session on
+that machine uses. A plain mount namespace (`unshare -rm rpmbuild ...`) does
+**not** isolate them: it shares the host's `/tmp` until something is mounted
+over it, and abstract sockets belong to the network namespace. The recipe above
+therefore uses `unshare -rmn`: `-n` gives the build its own network namespace
+(its abstract sockets are private) and `ip link set lo up` brings up that
+namespace's loopback, which the build needs (the `nasdaq` and `indices` tests
+talk to a fake server on `127.0.0.1`, so `-n` without `lo` up fails those two
+tests); `mount -t tmpfs tmpfs /tmp` hides the host's `/tmp/.X11-unix` and
+lock files. This needs unprivileged user and network namespaces, and a checkout
+and a topdir that are **not** under `/tmp` (the tmpfs hides them; use
+`/var/tmp` or your home directory). Mock and Koji build in their own chroot,
+where none of this is needed.
 
-```sh
-unshare -rm sh -c 'mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $PWD/rpmbuild" packaging/rpm/stocks.spec'
-```
-
-This needs a checkout (and thus `rpmbuild/`) outside `/tmp`, and unprivileged
-user namespaces. The build needs only the loopback device (the `nasdaq` and
-`indices` tests talk to a fake server on it), so do not add `-n` without
-bringing `lo` up first (`ip link set lo up`). Mock and Koji build in their own
-chroot, where none of this is needed.
+The binary in an RPM built this way (and in the published v0.1.0 RPM, built
+from the same spec) comes from Fedora's `%meson` as `buildtype=plain` with
+Fedora's `-O2` hardening flags. It is stripped, and it carries Fedora's
+standard `.gnu_debugdata` mini-symbol table. `rpmbuild` also produces
+`-debuginfo` and `-debugsource` packages with the full debug information;
+they are **not** among the published v0.1.0 release assets. The binary of
+`make install` is a different build, a plain `--buildtype=release` one
+stripped completely (see "Makefile").
