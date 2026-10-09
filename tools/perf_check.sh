@@ -66,7 +66,7 @@
 # Budgets (override from the environment for experiments; an empty value is an
 # error, not "use the default"). Set to about twice the worst of runs 1-10 in
 # README.md "Measured values and budgets" (default renderer, Xvfb); the
-# "measured max" figures below are the max row of that table (runs 1-13).
+# "measured max" figures below are the max row of that table (runs 1-16).
 # ---------------------------------------------------------------------------
 : "${BUDGET_FIRST_WINDOW_MS=600}"    # launch -> first mapped window, ms   (measured max 295)
 : "${BUDGET_RSS_MIB=640}"            # steady-state VmRSS, MiB             (measured max 311.2)
@@ -341,7 +341,11 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
+# GTK_IM_MODULE=simple: without it GTK connects to the host's real ibus-daemon
+# (a socket file under ~/.cache/ibus, outside every namespace here) and makes
+# it type into the user's desktop. GTK_A11Y=none: no accessibility bus.
 export GDK_BACKEND=x11 GSETTINGS_BACKEND=memory NO_AT_BRIDGE=1
+export GTK_IM_MODULE=simple GTK_A11Y=none
 # Offline for real: the namespace-local netlink monitor (see the header), and
 # the app's debug log (every request is logged) to verify it.
 export GIO_USE_NETWORK_MONITOR=netlink G_MESSAGES_DEBUG=stocks

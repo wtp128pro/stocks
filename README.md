@@ -3,8 +3,8 @@
 A small GTK4 desktop watchlist for stocks, ETFs and Fidelity mutual funds,
 written in C with Meson. It shows a list of the instruments you follow (price,
 change, a one-month sparkline) and, for the selected one, a price chart for
-1D / 1M / 3M / 6M / 1Y. It is built to idle cheaply: no timer runs unless the
-US market is open and the window is visible.
+1D / 1M / 3M / 6M / 1Y. It is built to idle cheaply: no periodic timer runs
+unless the US market is open, the window is visible and the network is up.
 
 It does not trade, log in to a broker, sync a Fidelity account, show news,
 send alerts or compute portfolio P&L, and it never will as part of this
@@ -54,13 +54,15 @@ compiler. The tools and tests below need `python3`; the GUI tests and
 meson setup build              # configure (debugoptimized, warning_level=3)
 meson compile -C build         # builds build/src/ui/stocks
 build/src/ui/stocks            # run
-xvfb-run -a meson test -C build   # 8 test suites; the GUI tests need a display
+GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test -C build   # 8 test suites; the GUI tests need a display
 ```
 
-`meson test` without `xvfb-run` works only if a display is available; the
-test suites that open windows pin `GDK_BACKEND=x11`, so run them under
-`xvfb-run -a` to keep them off your real session. The picker suite takes about
-20 s.
+Run the test gate as `GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test
+-C build`: without `GTK_IM_MODULE=simple` the GTK test processes connect to
+your real `ibus-daemon`, which makes typing bursts on your desktop. `meson
+test` without `xvfb-run` works only if a display is available; the test suites
+that open windows pin `GDK_BACKEND=x11`, so run them under `xvfb-run -a` to
+keep them off your real session. The picker suite takes about 20 s.
 
 ## Refresh policy
 
@@ -77,12 +79,24 @@ The decisions live in `src/ui/stk-scheduler.h` (pure logic, unit-tested in
   holidays and 13:00 early closes by rule) and the window is visible.
   Mutual funds publish one NAV per day, so healthy funds are not part of the
   periodic round.
-- When the market is closed, or the window is hidden/offline, there is no
-  timer at all.
+- With the market closed, the window hidden or the network offline no periodic
+  or refresh timer is armed. A refresh deadline armed before the close fires at
+  most once after it and triggers exactly one final round (the official
+  close); then nothing is armed. Hiding the window or losing the network
+  clears the deadline without a final round.
+- The only other timers are one-shot: the save debounce (3 s after the first
+  change) and the Add window's search debounce (300 ms), plus the provider's
+  per-request deadlines (10 s per attempt).
 - Hiding the window or losing the network cancels requests in flight.
 - A failed request keeps the cached data, marks the symbol stale, and is retried
   by the next refresh that includes it. The provider itself retries network
   errors, timeouts and HTTP 5xx twice with back-off (1 s, 2 s).
+- Pre-market, the 1D chart of a stock or ETF keeps showing the last trading
+  session until today's regular session has points: Nasdaq returns only
+  pre-market points before 09:30 ET and the provider keeps the regular session
+  only, so the refreshed 1D series is empty. An empty 1D series never replaces
+  a non-empty one, on screen or in the cache file, and does not mark the symbol
+  stale; only when no 1D series is held does the chart show "No data".
 
 ## Mutual funds: NAV only
 
@@ -229,28 +243,45 @@ Without them the script refuses to run (exit 2). Details of the method:
   the saving of cancelling the 60 s timer; it shows what the process costs
   while minimised. The two idle numbers are within run-to-run noise of each
   other; the clock-tick resolution is 10 ms, i.e. 0.017 % over 60 s.
-- **Rendering.** Under Xvfb there is no GPU display. The script sets
-  `GSK_DEBUG=renderer` and prints the renderer GTK picked; on the development
-  machine the default is `GskVulkanRenderer` (which Vulkan driver is behind it
-  was not checked). **All budgets and the main table below were measured with
-  that default renderer.** RSS and start-up time depend strongly on the
-  renderer (second table), and RSS under software rendering in Xvfb is not
-  what a desktop with a GPU shows; treat the budgets as a regression guard
-  for this setup, not as a general claim. `GSK_RENDERER=cairo
-  tools/perf_check.sh` measures another renderer.
+- **Rendering.** The script sets `GSK_DEBUG=renderer` and prints the renderer
+  GTK picked. In the runs below it was `GskVulkanRenderer`, and the Vulkan
+  device was not software: with `GDK_DEBUG=vulkan` GTK listed `Vulkan Device 0:
+  NVIDIA GeForce RTX 5060 Ti (Discrete GPU)` and `Vulkan Device 1: llvmpipe
+  (CPU)` and logged `Using Vulkan device 0`; the nvidia kernel modules were
+  loaded and `libnvidia-*` libraries were mapped into the `stocks` process
+  (checked in `/proc/<pid>/maps`). Only GL fell back to llvmpipe (`Not using
+  GL: renderer is llvmpipe`). Xvfb itself is not accelerated; the app renders
+  through the host's GPU driver anyway. **All budgets and the main table below
+  were measured with that default renderer on that host.** The ~311 MiB RSS
+  therefore includes the GPU driver's mappings and is host-dependent: on a
+  machine with another or no Vulkan driver the default renderer, and the RSS,
+  will differ. The cairo (~160 MiB) and ngl (~258 MiB) rows of the second
+  table show how much the renderer matters. Treat the budgets as a regression
+  guard for this host and setup, not as a general claim. `GSK_RENDERER=cairo
+  tools/perf_check.sh` measures another renderer. The script exports
+  `GTK_IM_MODULE=simple GTK_A11Y=none` for every process it starts (see
+  "Input method" below).
+- **Input method.** GTK processes under Xvfb with default settings connect to
+  the host's real `ibus-daemon` (a socket under `~/.cache/ibus`), which makes
+  the desktop's input method react. The script therefore sets
+  `GTK_IM_MODULE=simple`; under `strace -f -e trace=connect` a short run
+  showed no connect to any ibus socket (only the private X socket, the
+  disabled session bus path and the system bus socket).
 
 ### Measured values and budgets
 
-Thirteen runs of the script on the development machine (Intel Core Ultra 7
-265K, 20 CPUs, Linux 7.2 x86-64, GTK 4.22.5, Xvfb, default renderer
-`GskVulkanRenderer`, offline and verified request-free; each row is a separate
-full run, nothing else started on purpose). Runs 1-8 were made before one more
-assertion (the visibility check above) was added to the script; runs 9-10
-before the last change of the start-up code (parameter validation, stage
-checks, handing the script down as a file descriptor), runs 11-13 after it.
-That change does not alter what is measured or how. Idle CPU varied from
-0.050 to 0.233 % (a few clock ticks; the cause of the variation was not
-investigated), which is why its budget is set well above the worst run:
+Sixteen runs of the script on the development machine (Intel Core Ultra 7
+265K, NVIDIA GeForce RTX 5060 Ti, 20 CPUs, Linux 7.2 x86-64, GTK 4.22.5, Xvfb,
+default renderer `GskVulkanRenderer` on the NVIDIA device, offline and verified
+request-free; each row is a separate full run, nothing else started on
+purpose). Runs 1-8 were made before one more assertion (the visibility check
+above) was added to the script; runs 9-10 before the last change of the
+start-up code (parameter validation, stage checks, handing the script down as a
+file descriptor), runs 11-13 after it, runs 14-16 after `GTK_IM_MODULE=simple`
+was added. None of these changes alters what is measured or how. Idle CPU
+varied from 0.050 to 0.233 % (a few clock ticks; the cause of the variation
+was not investigated), which is why its budget is set well above the worst
+run:
 
 | Run | first window (ms) | RSS visible (MiB) | idle CPU visible (%) | idle CPU hidden (%) |
 | --- | --- | --- | --- | --- |
@@ -267,10 +298,15 @@ investigated), which is why its budget is set well above the worst run:
 | 11 | 276 | 310.8 | 0.067 | 0.067 |
 | 12 | 290 | 311.1 | 0.233 | 0.067 |
 | 13 | 281 | 310.9 | 0.117 | 0.083 |
+| 14 | 253 | 310.3 | 0.100 | 0.067 |
+| 15 | 273 | 310.5 | 0.067 | 0.067 |
+| 16 | 278 | 310.8 | 0.067 | 0.100 |
 | **max** | **295** | **311.2** | **0.233** | **0.183** |
 
 Budgets were set at about twice the worst of runs 1-10 and were kept when runs
-11-13 stayed below them (the idle CPU budget is 1.7 times the worst value seen):
+11-16 stayed below them; the final script (with `GTK_IM_MODULE=simple`)
+measured runs 14-16 and no measurement demanded a change (the idle CPU budget
+is 1.7 times the worst value seen):
 
 | Measurement | Budget variable | Value |
 | --- | --- | --- |
@@ -284,7 +320,7 @@ visibility assertion was added; not used for the budgets, single runs):
 
 | `GSK_RENDERER` | reported renderer | first window (ms) | RSS visible (MiB) | idle CPU visible / hidden (%) |
 | --- | --- | --- | --- | --- |
-| unset (default) | `GskVulkanRenderer` | 267-295 (13 runs) | 309.8-311.2 | 0.050-0.233 / 0.050-0.183 |
+| unset (default) | `GskVulkanRenderer` (NVIDIA discrete GPU, see "Rendering") | 253-295 (16 runs) | 309.8-311.2 | 0.050-0.233 / 0.050-0.183 |
 | `cairo` | `GskCairoRenderer` | 93 | 159.8 | 0.017 / 0.000 |
 | `ngl` | `GskGLRenderer` | 98 | 257.5 | 0.000 / 0.000 |
 
@@ -299,10 +335,20 @@ empty, negative) exits 2 immediately, before anything is started.
 ## Known limits
 
 - **Already running at the open.** There is no timer while the market is
-  closed. An instance that is left running before 09:30 ET does not start
-  refreshing by itself at the open: it refreshes on the next show, focus
-  regain or network event, and periodic refreshes begin one period after that
-  round (`stk-scheduler.h`).
+  closed, so an instance that is left running (visible, online) before 09:30 ET
+  does not start refreshing by itself at the open: it refreshes on the next
+  show, focus regain or network event, and periodic refreshes begin one period
+  after that round (`stk-scheduler.h`).
+- **Final round after the close.** A window left visible and online across
+  16:00 ET gets exactly one more refresh when the deadline armed before the
+  close fires (up to one period after 16:00), then nothing. That round skips a
+  quote or chart that succeeded in the 5 s before the close. A hidden or
+  offline app gets no such round; showing it or reconnecting refreshes.
+- **Pre-market 1D chart.** In pre-market any non-empty 1D series that is held
+  is kept, even when it is older than the last session (for example after the
+  app was not run for several days). Nasdaq returns only pre-market points
+  before 09:30 ET and the provider keeps the regular session only, so the
+  1D chart shows the last session until today's regular session has points.
 - Quotes depend on the unofficial API (see above); a failed refresh shows
   the previous data dimmed, not an error dialog. Fidelity funds'
   NAV arrives once a day.
