@@ -12,8 +12,11 @@
  * freshness is per job (a job that was cancelled, dropped or failed is never
  * skipped because the symbol's quote is recent), failed jobs of any symbol
  * are retried by the next round that can (periodic while the market is open,
- * else the next event round), and the stale marks change only where
- * stk-scheduler.h says they do (checked over randomised input sequences).
+ * else the next event round), the stale marks change only where
+ * stk-scheduler.h says they do (checked over randomised input sequences), the
+ * deadline armed before the close fires once after it as the one final round
+ * (the official close of a window left visible), and a refreshed 1D series
+ * without points never replaces a non-empty one (stk_sched_series_is_hollow()).
  */
 #include <glib.h>
 #include <string.h>
@@ -429,17 +432,212 @@ test_market_open_boundaries(void)
   }
 }
 
+/* A window left visible across the 16:00 ET close: the deadline armed before
+ * the close fires once after it and issues exactly ONE final round (QUOTE of
+ * every non-FUND symbol plus the DETAIL of the selection), then no timer. */
 static void
-test_market_closes_while_ticking(void)
+test_final_round_after_close(void)
 {
-  /* 15:59:30 ET: the first period ends after the 16:00 close. */
+  struct {
+    const char *what;
+    gint64 start_wall_ms;
+    gint64 stall_s;       /* how long after the deadline the timer actually fires */
+    gboolean prior_round; /* a periodic round before the close, then the final one */
+    gboolean finish_prior;
+  } cases[] = {
+      {"deadline right after the close", wall_utc(2026, 10, 8, 19, 59, 30), 0, FALSE, TRUE},
+      {"deadline exactly at the close", wall_utc(2026, 10, 8, 19, 59, 0), 0, FALSE, TRUE},
+      {"last millisecond before the close", wall_utc(2026, 10, 8, 20, 0, 0) - 1, 0, FALSE, TRUE},
+      {"periodic round, then the final one", wall_utc(2026, 10, 8, 19, 58, 30), 0, TRUE, TRUE},
+      {"previous round still in flight", wall_utc(2026, 10, 8, 19, 58, 30), 0, TRUE, FALSE},
+      {"timer fires an hour late", wall_utc(2026, 10, 8, 19, 58, 30), 3600, FALSE, TRUE},
+      {"early close day (13:00 ET)", wall_utc(2026, 11, 27, 17, 59, 30), 0, FALSE, TRUE},
+  };
+  for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+    g_test_message("%s", cases[i].what);
+    Fx *fx = fx_started(cases[i].start_wall_ms);
+    fx_select(fx, "SPY", STK_RANGE_1D);
+    fx_finish_all(fx, STK_SCHED_RESULT_OK);
+    gint64 deadline = stk_scheduler_next_wakeup_us(fx->s);
+    g_assert_cmpint(deadline, ==, fx->mono_us + STK_SCHED_PERIOD_US);
+
+    if (cases[i].prior_round) {
+      fx_advance(fx, 60);
+      g_assert_true(stk_market_is_open(fx->wall_ms));
+      fx_tick(fx);
+      g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+      g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, fx->mono_us + STK_SCHED_PERIOD_US);
+      if (cases[i].finish_prior)
+        fx_finish_all(fx, STK_SCHED_RESULT_OK);
+      deadline = stk_scheduler_next_wakeup_us(fx->s);
+    }
+
+    /* The deadline has been armed while the market was open, and it stays. */
+    fx_advance(fx, (deadline - fx->mono_us) / SEC + cases[i].stall_s);
+    g_assert_false(stk_market_is_open(fx->wall_ms));
+    guint mark = fx->all->len;
+    fx_tick(fx);
+    g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1); /* cleared at once */
+    if (cases[i].finish_prior) {
+      g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+      g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "AAPL", -1), ==, 1);
+      g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "SPY", -1), ==, 1);
+      g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "FXAIX", -1), ==, 0); /* healthy fund */
+    }
+    fx_finish_all(fx, STK_SCHED_RESULT_OK);
+    if (cases[i].finish_prior) {
+      /* The selection's 1D DETAIL job is part of the round; nothing else is. */
+      g_assert_cmpuint(COUNT_SINCE(fx, mark, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+      g_assert_cmpuint(COUNT_SINCE(fx, mark, STK_SCHED_FETCH_SERIES, NULL, -1), ==, 1);
+      g_assert_cmpuint(COUNT_SINCE(fx, mark, STK_SCHED_FETCH_SERIES, "SPY", STK_RANGE_1D), ==, 1);
+    }
+
+    /* Exactly once: neither the same instant, nor later ticks, nor any
+     * amount of time repeat it, and no timer ever comes back. */
+    mark = fx->all->len;
+    fx_tick(fx);
+    NO_ACTIONS(fx);
+    for (guint k = 0; k < 5; k++) {
+      fx_advance(fx, 61);
+      fx_tick(fx);
+      NO_ACTIONS(fx);
+      g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+    }
+    g_assert_cmpuint(fx->all->len, ==, mark);
+    g_assert_cmpuint(stk_scheduler_n_inflight(fx->s), ==, 0);
+    fx_free(fx);
+  }
+}
+
+/* The final round is a periodic round: failed jobs, funds included, ride
+ * along with it; a healthy fund does not. */
+static void
+test_final_round_retries_failed_jobs(void)
+{
   Fx *fx = fx_started(wall_utc(2026, 10, 8, 19, 59, 30));
+  fx_done(fx, out_id(fx, "FXAIX"), STK_SCHED_RESULT_FAILED);
   fx_finish_all(fx, STK_SCHED_RESULT_OK);
-  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, fx->mono_us + STK_SCHED_PERIOD_US);
+  g_assert_true(stk_scheduler_is_stale(fx->s, "FXAIX"));
   fx_advance(fx, 60);
   fx_tick(fx);
-  NO_ACTIONS(fx); /* closed by now: no round and no timer */
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "AAPL", -1), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "SPY", -1), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "FXAIX", -1), ==, 1);
   g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  g_assert_false(stk_scheduler_is_stale(fx->s, "FXAIX"));
+  fx_advance(fx, 600);
+  fx_tick(fx);
+  NO_ACTIONS(fx);
+  fx_free(fx);
+
+  /* Only funds, none failed: there is no deadline, hence no final round. */
+  fx = fx_new(wall_utc(2026, 10, 8, 19, 59, 30));
+  const StkSchedSymbol funds[] = {{"FXAIX", STK_KIND_FUND}};
+  fx_symbols(fx, funds, G_N_ELEMENTS(funds));
+  fx_online(fx, TRUE);
+  fx_visible(fx, TRUE);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_advance(fx, 60);
+  fx_tick(fx);
+  NO_ACTIONS(fx);
+  fx_free(fx);
+}
+
+/* No final round while hidden or offline (a window that is not shown, or a
+ * network that is not there, gets its refresh from the event round that
+ * shows / reconnects, which is itself after the close and arms nothing). */
+static void
+test_no_final_round_when_hidden_or_offline(void)
+{
+  for (guint variant = 0; variant < 4; variant++) {
+    gboolean by_network = (variant & 1) != 0;
+    gboolean before_close = (variant & 2) != 0; /* else between the close and the deadline */
+    Fx *fx = fx_started(wall_utc(2026, 10, 8, 19, 59, 30));
+    fx_finish_all(fx, STK_SCHED_RESULT_OK);
+    fx_advance(fx, before_close ? 10 : 40);
+    g_assert_cmpint(stk_market_is_open(fx->wall_ms), ==, before_close);
+    if (by_network)
+      fx_online(fx, FALSE);
+    else
+      fx_visible(fx, FALSE);
+    g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+
+    fx_advance(fx, 60); /* past the deadline the window would have had */
+    fx_tick(fx);
+    NO_ACTIONS(fx);
+    fx_focus(fx);
+    NO_ACTIONS(fx);
+    g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+
+    if (by_network)
+      fx_online(fx, TRUE);
+    else
+      fx_visible(fx, TRUE);
+    g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 3); /* the event round */
+    g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+    fx_finish_all(fx, STK_SCHED_RESULT_OK);
+    fx_advance(fx, 120);
+    fx_tick(fx);
+    NO_ACTIONS(fx);
+    fx_free(fx);
+  }
+}
+
+/* An event round that already happens after the close is the refresh the
+ * final round would be; one before the close does not replace it. */
+static void
+test_event_round_and_final_round(void)
+{
+  /* After the close: the pending final round is cancelled. */
+  Fx *fx = fx_started(wall_utc(2026, 10, 8, 19, 59, 30));
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_advance(fx, 40); /* 16:00:10 ET */
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), !=, -1);
+  fx_focus(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 3);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_advance(fx, 60);
+  fx_tick(fx);
+  NO_ACTIONS(fx);
+  fx_free(fx);
+
+  /* Before the close: the deadline is untouched and the final round follows. */
+  fx = fx_started(wall_utc(2026, 10, 8, 19, 59, 0));
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  gint64 deadline = stk_scheduler_next_wakeup_us(fx->s);
+  fx_advance(fx, 10);
+  fx_focus(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 3);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, deadline);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_advance(fx, 50);
+  g_assert_cmpint(fx->mono_us, ==, deadline);
+  g_assert_false(stk_market_is_open(fx->wall_ms));
+  fx_tick(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_free(fx);
+
+  /* Calls that are not rounds (a selection change, a completion) between the
+   * close and the deadline leave the final round alone. */
+  fx = fx_started(wall_utc(2026, 10, 8, 19, 59, 30));
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  deadline = stk_scheduler_next_wakeup_us(fx->s);
+  fx_advance(fx, 35);
+  g_assert_false(stk_market_is_open(fx->wall_ms));
+  fx_select(fx, "AAPL", STK_RANGE_1M);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, deadline);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, deadline);
+  fx_advance(fx, 25);
+  fx_tick(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
   fx_free(fx);
 }
 
@@ -809,9 +1007,46 @@ test_clock_forward_jump_makes_deadline_due(void)
   g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, fx->mono_us + STK_SCHED_PERIOD_US);
   fx_finish_all(fx, STK_SCHED_RESULT_OK);
 
-  /* A forward jump straight out of the session: no round, no timer. */
+  /* A forward jump straight out of the session makes the pending deadline due
+   * at once; with the market closed that round is the one final round, after
+   * which there is no timer. */
   fx->mono_us += 20 * SEC;
   fx->wall_ms += 8 * 3600 * 1000;
+  fx_tick(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_advance(fx, 600);
+  fx_tick(fx);
+  NO_ACTIONS(fx);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_free(fx);
+
+  /* The same jump seen first by a call that is not a tick: the deadline is due
+   * at once, the market is closed, and the tick then runs the final round once. */
+  fx = fx_started(wall_utc(2026, 10, 8, 19, 50, 0));
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx->mono_us += 20 * SEC;
+  fx->wall_ms += 3600 * 1000;
+  stk_scheduler_set_selection(fx->s, now_of(fx), NULL, STK_RANGE_1D);
+  collect(fx);
+  NO_ACTIONS(fx);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, fx->mono_us);
+  fx_tick(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
+  g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_tick(fx);
+  NO_ACTIONS(fx);
+  fx_free(fx);
+
+  /* The same jump over a hidden window: no deadline is pending, so there is no
+   * final round either. */
+  fx = fx_started(wall_utc(2026, 10, 8, 19, 50, 0));
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_visible(fx, FALSE);
+  fx->mono_us += 20 * SEC;
+  fx->wall_ms += 3600 * 1000;
   fx_tick(fx);
   NO_ACTIONS(fx);
   g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
@@ -848,12 +1083,25 @@ test_clock_backward_jump_changes_nothing(void)
   g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
   fx_finish_all(fx, STK_SCHED_RESULT_OK);
 
-  /* Backwards into closed hours: the timer goes away. */
+  /* Backwards into closed hours: nothing is armed while the market is closed,
+   * but the deadline that was armed survives and fires once, as the final
+   * round (the wall clock says the session is over), then no timer. */
   fx->mono_us += 5 * SEC;
   fx->wall_ms = wall_utc(2026, 10, 8, 3, 0, 0);
   fx_tick(fx);
   NO_ACTIONS(fx);
+  gint64 pending = stk_scheduler_next_wakeup_us(fx->s);
+  g_assert_cmpint(pending, >, fx->mono_us);
+  g_assert_cmpint(pending, <=, fx->mono_us + STK_SCHED_PERIOD_US);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx->mono_us = pending;
+  fx_tick(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 2);
   g_assert_cmpint(stk_scheduler_next_wakeup_us(fx->s), ==, -1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_advance(fx, 600);
+  fx_tick(fx);
+  NO_ACTIONS(fx);
   fx_free(fx);
 }
 
@@ -1322,8 +1570,11 @@ fx_finish_all_sane(Fx *fx)
 
 /* Applies a long random sequence of inputs and checks after every step:
  *  - the harness invariants (one request per symbol, at most four, ...);
- *  - no FETCH, and no timer, while hidden or offline; no timer while the
- *    market is closed; the timer is never more than one period away;
+ *  - no FETCH, and no timer, while hidden or offline; nothing is armed while
+ *    the market is closed (a deadline that exists then is the unchanged one
+ *    armed while it was open: the final round, which clears it when it fires,
+ *    and which an event round after the close cancels); the timer is never
+ *    more than one period away;
  *  - the stale-mark contract: is_stale() of a symbol changes only when the
  *    input is a completion of that symbol's request, a selection change from
  *    or to it, or a change of the tracked set that adds or removes it;
@@ -1333,6 +1584,7 @@ static void
 test_random_inputs_keep_invariants(void)
 {
   const gint64 starts[] = {WALL_OPEN, wall_utc(2026, 10, 8, 19, 52, 0), WALL_AFTER_HOURS};
+  guint final_rounds = 0; /* final rounds seen over all seeds */
   for (guint seed = 1; seed <= 90; seed++) {
     g_test_message("seed %u", seed);
     GRand *rnd = g_rand_new_with_seed(seed);
@@ -1351,6 +1603,9 @@ test_random_inputs_keep_invariants(void)
         before[i] = stk_scheduler_is_stale(fx->s, k_pool[i].symbol);
       guint mark = fx->all->len;
       gboolean called = TRUE;
+      gboolean ticked = FALSE;
+      gboolean focused = FALSE;
+      gint64 prev_wake = stk_scheduler_next_wakeup_us(fx->s);
 
       switch (g_rand_int_range(rnd, 0, 10)) {
       case 0: {
@@ -1388,10 +1643,12 @@ test_random_inputs_keep_invariants(void)
         fx_online(fx, online);
         break;
       case 4:
+        focused = TRUE;
         fx_focus(fx);
         break;
       case 5:
         fx_advance(fx, g_rand_int_range(rnd, 0, 90));
+        ticked = TRUE;
         fx_tick(fx);
         break;
       default:
@@ -1422,6 +1679,7 @@ test_random_inputs_keep_invariants(void)
           g_assert_cmpint(stk_scheduler_is_stale(fx->s, k_pool[i].symbol), ==, before[i]);
       }
       gint64 wake = stk_scheduler_next_wakeup_us(fx->s);
+      gboolean open = stk_market_is_open(fx->wall_ms);
       if (!(visible && online)) {
         g_assert_cmpint(wake, ==, -1);
         g_assert_cmpuint(COUNT_SINCE(fx, mark, STK_SCHED_FETCH_QUOTE, NULL, -1), ==, 0);
@@ -1429,8 +1687,22 @@ test_random_inputs_keep_invariants(void)
       }
       if (wake != -1) {
         g_assert_true(visible && online);
-        g_assert_true(stk_market_is_open(fx->wall_ms));
         g_assert_cmpint(wake, <=, fx->mono_us + STK_SCHED_PERIOD_US);
+        /* While the market is closed nothing is ever armed: the only deadline
+         * there can be is one that was armed while it was open (the final
+         * round), unchanged. */
+        if (!open)
+          g_assert_cmpint(wake, ==, prev_wake);
+      }
+      if (!open) {
+        /* The final round happens when the deadline fires, once: no deadline
+         * is left behind; and an event round after the close owes none. */
+        if (ticked && prev_wake != -1 && fx->mono_us >= prev_wake) {
+          g_assert_cmpint(wake, ==, -1);
+          final_rounds++; /* (its requests may merge with ones still in flight) */
+        }
+        if (focused && visible && online)
+          g_assert_cmpint(wake, ==, -1);
       }
     }
 
@@ -1446,6 +1718,51 @@ test_random_inputs_keep_invariants(void)
     fx_free(fx);
     g_rand_free(rnd);
   }
+  g_assert_cmpuint(final_rounds, >, 0); /* the walk does reach the close with a live deadline */
+}
+
+static StkSeries *
+make_series(StkRange range, guint n_points)
+{
+  StkSeries *s = stk_series_new(range, 100.0, n_points);
+  g_assert_nonnull(s);
+  for (guint i = 0; i < n_points; i++)
+    g_assert_true(stk_series_append(s, 1000 + (gint64)i * 60000, 100.0 + i));
+  return s;
+}
+
+/* The result policy of a refreshed 1D series (pure part of apply_series() in
+ * stk-app.c): pre-market Nasdaq answers a 1D request with no regular-session
+ * point, which must not replace the last session. */
+static void
+test_hollow_series_policy(void)
+{
+  g_autoptr(StkSeries) empty_1d = make_series(STK_RANGE_1D, 0);
+  g_autoptr(StkSeries) full_1d = make_series(STK_RANGE_1D, 390);
+  g_autoptr(StkSeries) one_1d = make_series(STK_RANGE_1D, 1);
+  g_autoptr(StkSeries) empty_1m = make_series(STK_RANGE_1M, 0);
+  g_autoptr(StkSeries) full_1m = make_series(STK_RANGE_1M, 21);
+  g_autoptr(StkSeries) empty_1y = make_series(STK_RANGE_1Y, 0);
+  g_autoptr(StkSeries) full_1y = make_series(STK_RANGE_1Y, 250);
+
+  /* An empty 1D result is kept back by any non-empty 1D series. */
+  g_assert_true(stk_sched_series_is_hollow(empty_1d, full_1d));
+  g_assert_true(stk_sched_series_is_hollow(empty_1d, one_1d));
+  /* ... and replaces only when nothing non-empty is held. */
+  g_assert_false(stk_sched_series_is_hollow(empty_1d, NULL));
+  g_assert_false(stk_sched_series_is_hollow(empty_1d, empty_1d));
+  /* A series with points replaces normally, whatever is held. */
+  g_assert_false(stk_sched_series_is_hollow(full_1d, full_1d));
+  g_assert_false(stk_sched_series_is_hollow(one_1d, full_1d));
+  g_assert_false(stk_sched_series_is_hollow(full_1d, empty_1d));
+  g_assert_false(stk_sched_series_is_hollow(full_1d, NULL));
+  /* Other ranges are never kept back, and a series of another range never
+   * keeps a 1D one back. */
+  g_assert_false(stk_sched_series_is_hollow(empty_1m, full_1m));
+  g_assert_false(stk_sched_series_is_hollow(empty_1y, full_1y));
+  g_assert_false(stk_sched_series_is_hollow(empty_1m, full_1d));
+  g_assert_false(stk_sched_series_is_hollow(empty_1d, full_1m));
+  g_assert_false(stk_sched_series_is_hollow(empty_1d, full_1y));
 }
 
 int
@@ -1458,7 +1775,11 @@ main(int argc, char **argv)
   g_test_add_func("/scheduler/funds-only", test_periodic_skips_fund_only_list);
   g_test_add_func("/scheduler/no-timer/market-closed", test_no_timer_when_market_closed);
   g_test_add_func("/scheduler/market-boundaries", test_market_open_boundaries);
-  g_test_add_func("/scheduler/market-closes", test_market_closes_while_ticking);
+  g_test_add_func("/scheduler/final-round/after-close", test_final_round_after_close);
+  g_test_add_func("/scheduler/final-round/failed-jobs", test_final_round_retries_failed_jobs);
+  g_test_add_func("/scheduler/final-round/hidden-offline",
+                  test_no_final_round_when_hidden_or_offline);
+  g_test_add_func("/scheduler/final-round/event-round", test_event_round_and_final_round);
   g_test_add_func("/scheduler/no-timer/hidden-offline", test_no_timer_when_hidden_or_offline);
   g_test_add_func("/scheduler/focus-regain", test_focus_regain_refreshes_once);
   g_test_add_func("/scheduler/inflight-dedup-cap", test_inflight_dedup_and_cap);
@@ -1492,5 +1813,6 @@ main(int argc, char **argv)
   g_test_add_func("/scheduler/regress/selection-stale",
                   test_selection_change_drops_detail_stale_mark);
   g_test_add_func("/scheduler/regress/random", test_random_inputs_keep_invariants);
+  g_test_add_func("/scheduler/regress/hollow-1d-series", test_hollow_series_policy);
   return g_test_run();
 }

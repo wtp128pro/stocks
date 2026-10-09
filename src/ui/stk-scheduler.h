@@ -34,7 +34,8 @@
  *    funds publish one NAV a day and the 1M series changes once a day, so a
  *    healthy fund is left alone) happens every STK_SCHED_PERIOD_US, but ONLY
  *    while the market is open (stk_market_is_open() of the wall clock), the
- *    window is visible and the network is available.
+ *    window is visible and the network is available. One more periodic
+ *    round, the "final round", follows the close (see Timer).
  *  - Freshness is per job. Of the jobs a round includes, one whose latest
  *    request succeeded less than STK_SCHED_MIN_EVENT_GAP_US ago is skipped
  *    (alt-tab bursts do not cause repeated requests) and every other one is
@@ -45,12 +46,22 @@
  *    over (nothing fresh, no failure) whenever the selection changes.
  *  - Timer: stk_scheduler_next_wakeup_us() is the monotonic deadline of the
  *    next periodic round while "active AND market open AND (at least one
- *    non-FUND symbol OR at least one failed job)", and -1 (arm no timer at
- *    all) otherwise. The scheduler does not wake itself at the next market
- *    open: while the market is closed there is no timer, so a window left
- *    alone across the open starts refreshing only after the next call of a
- *    mutator (event round, selection change, ...) that finds the market open;
- *    the first periodic round then follows one period later.
+ *    non-FUND symbol OR at least one failed job)". A deadline is armed only
+ *    while the market is open, and one that is armed survives the close
+ *    (while the conditions other than "market open" still hold): when it
+ *    fires with the market closed, exactly ONE final round is issued (the
+ *    periodic round's jobs: the official close of a window left visible
+ *    across 16:00 ET), after which there is no deadline. Nothing is armed
+ *    while the market is closed, so there is no polling after the close, and
+ *    an event round that finds the market closed (it is itself a refresh
+ *    after the close) cancels the final round still owed. Hiding the window
+ *    or losing the network clears the deadline, so no final round happens
+ *    then either (showing / reconnecting is an event round). The scheduler
+ *    does not wake itself at the next market open: while the market is
+ *    closed there is no timer, so a window left alone across the open starts
+ *    refreshing only after the next call of a mutator (event round,
+ *    selection change, ...) that finds the market open; the first periodic
+ *    round then follows one period later.
  *  - In flight: at most one request per symbol, at most
  *    STK_SCHED_MAX_INFLIGHT in total. A job that is already in flight (or
  *    already waiting) is merged: asking again does not start a second
@@ -82,9 +93,11 @@
  *  - Clock jumps: deadlines use the monotonic clock only. If the wall clock
  *    advanced more than STK_SCHED_JUMP_TOLERANCE_US more than the monotonic
  *    clock since the previous call (suspend/resume, clock set forward), a
- *    pending periodic deadline becomes due at once (one round, never a
- *    burst). A wall clock that moves backwards changes nothing but the
- *    market-open evaluation. A wall clock outside the supported calendar
+ *    pending deadline becomes due at once (one round, never a burst; if the
+ *    jump left the market closed, that round is the final round). A wall
+ *    clock that moves backwards changes nothing but the market-open
+ *    evaluation (moved into closed hours, the pending deadline fires as the
+ *    final round). A wall clock outside the supported calendar
  *    (STK_MARKET_MIN_YEAR..STK_MARKET_MAX_YEAR) counts as "market closed".
  *    A periodic round that fires late is followed by the next one a full
  *    period later, never by catch-up rounds.
@@ -233,10 +246,11 @@ void stk_scheduler_focus_regained(StkScheduler *self, StkSchedTime now);
  * @now: the current time.
  *
  * To be called when the timer armed for stk_scheduler_next_wakeup_us() fires.
- * Starts a periodic round if the deadline has been reached and the market is
- * open, the window visible and the network available; then schedules the
- * next deadline (or none). Calling it early, or with no deadline, only
- * re-evaluates the conditions.
+ * If the deadline has been reached and the window is visible and the network
+ * available: starts a periodic round and schedules the next deadline while
+ * the market is open; with the market closed it starts the one final round
+ * instead and leaves no deadline (see "Timer"). Calling it early, or with no
+ * deadline, only re-evaluates the conditions.
  */
 void stk_scheduler_tick(StkScheduler *self, StkSchedTime now);
 
@@ -291,6 +305,27 @@ gboolean stk_scheduler_is_stale(StkScheduler *self, const char *symbol);
 
 /** Returns: the number of requests outstanding, cancelled ones included. */
 guint stk_scheduler_n_inflight(StkScheduler *self);
+
+/**
+ * stk_sched_series_is_hollow:
+ * @fresh: a series that was just fetched.
+ * @held: (nullable): a series the owner holds for the same instrument (shown,
+ *   cached), or NULL.
+ *
+ * The result policy for a refreshed intraday series. Before the open the
+ * provider has no regular-session point for the new day, so a successful 1D
+ * refresh can legitimately arrive with zero points; it carries no information
+ * about the last session, which @held still describes. The owner must then
+ * keep @held (neither show nor store @fresh) and must not mark the symbol
+ * stale: the request did not fail.
+ *
+ * Returns: TRUE iff @fresh has the range STK_RANGE_1D and no points while
+ *   @held has that range and at least one point (so @fresh must not replace
+ *   @held). FALSE in every other case: a series with points replaces
+ *   normally, other ranges are never kept back, and an empty series replaces
+ *   only when nothing non-empty is held (the owner then shows "No data").
+ */
+gboolean stk_sched_series_is_hollow(const StkSeries *fresh, const StkSeries *held);
 
 G_END_DECLS
 

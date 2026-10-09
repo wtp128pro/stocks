@@ -316,6 +316,20 @@ apply_quote(StkApp *self, const Request *r, const StkQuote *quote)
   schedule_save(self);
 }
 
+/* A successful 1D refresh with no point (Nasdaq before the open has none of
+ * the new regular session yet) must not replace the last session's series,
+ * neither on screen nor in the cache; see stk_sched_series_is_hollow(). */
+static gboolean
+keeps_last_session(StkApp *self, const Request *r, StkRowItem *item, const StkSeries *series)
+{
+  if (series->range != STK_RANGE_1D || series->n_points > 0)
+    return FALSE;
+  if (stk_sched_series_is_hollow(series, stk_row_item_get_detail_series(item)))
+    return TRUE;
+  g_autoptr(StkSeries) cached = stk_cache_get_series(self->cache, r->symbol, STK_RANGE_1D, NULL);
+  return stk_sched_series_is_hollow(series, cached);
+}
+
 static void
 apply_series(StkApp *self, const Request *r, StkSeries *series)
 {
@@ -325,6 +339,10 @@ apply_series(StkApp *self, const Request *r, StkSeries *series)
   if (series->range != r->range) { /* the provider contract forbids it; never mix ranges up */
     g_debug("series of %s: asked for %s, got %s", r->symbol, stk_range_to_string(r->range),
             stk_range_to_string(series->range));
+    return;
+  }
+  if (keeps_last_session(self, r, item, series)) {
+    g_debug("series %s/1D has no point: keeping the last session", r->symbol);
     return;
   }
   gboolean matched = FALSE;

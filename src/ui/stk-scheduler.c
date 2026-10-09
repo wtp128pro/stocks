@@ -303,11 +303,16 @@ record_result(Entry *e, guint jobs, StkSchedResult result, gint64 now_us)
  * non-FUND symbols, and every job that failed (any symbol, funds included).
  * Each job is judged on its own: one whose latest request succeeded very
  * recently is skipped, any other (never fetched, cancelled, dropped by hide /
- * offline, failed) is wanted, whatever the state of the symbol's other jobs. */
+ * offline, failed) is wanted, whatever the state of the symbol's other jobs.
+ * An event round that finds the market closed is itself the refresh after
+ * the close, so the final round still owed to a pending deadline (see
+ * stk_scheduler_tick()) is cancelled. */
 static void
 add_round(StkScheduler *self, StkSchedTime now, gboolean event)
 {
   static const guint jobs[] = {WANT_QUOTE, WANT_SPARK, WANT_DETAIL};
+  if (event && !market_open(now.wall_ms))
+    self->deadline_us = -1;
   for (guint i = 0; i < self->entries->len; i++) {
     Entry *e = g_ptr_array_index(self->entries, i);
     if (e->removed)
@@ -349,16 +354,17 @@ has_periodic_work(const StkScheduler *self)
   return FALSE;
 }
 
-/* Re-evaluates whether the periodic timer may exist. */
+/* Re-evaluates whether the periodic timer may exist. A deadline is armed only
+ * while the market is open; once armed it survives the close, because when it
+ * fires it issues the one final round (see stk_scheduler_tick()). It is
+ * never armed (or re-armed) while the market is closed. */
 static void
 rearm(StkScheduler *self, StkSchedTime now)
 {
-  if (is_active(self) && has_periodic_work(self) && market_open(now.wall_ms)) {
-    if (self->deadline_us < 0)
-      self->deadline_us = sat_add(now.mono_us, STK_SCHED_PERIOD_US);
-  } else {
+  if (!is_active(self) || !has_periodic_work(self))
     self->deadline_us = -1;
-  }
+  else if (self->deadline_us < 0 && market_open(now.wall_ms))
+    self->deadline_us = sat_add(now.mono_us, STK_SCHED_PERIOD_US);
 }
 
 /* First step of every input: clock-jump detection. */
@@ -572,9 +578,13 @@ stk_scheduler_tick(StkScheduler *self, StkSchedTime now)
     gint64 next = sat_add(self->deadline_us, STK_SCHED_PERIOD_US);
     if (next <= now.mono_us)
       next = sat_add(now.mono_us, STK_SCHED_PERIOD_US); /* late: no catch-up rounds */
-    if (is_active(self) && market_open(now.wall_ms))
+    /* Open: the periodic round. Closed: the market closed since the round
+     * that armed this deadline (an event round after the close would have
+     * cleared it), so this is the final round and nothing is armed after it. */
+    gboolean open = market_open(now.wall_ms);
+    if (is_active(self))
       add_round(self, now, FALSE);
-    self->deadline_us = next; /* rearm() clears it if the conditions are gone */
+    self->deadline_us = open ? next : -1; /* rearm() clears it if the conditions are gone */
   }
   finish(self, now);
 }
@@ -652,4 +662,12 @@ stk_scheduler_n_inflight(StkScheduler *self)
 {
   g_return_val_if_fail(self != NULL, 0);
   return self->n_inflight;
+}
+
+gboolean
+stk_sched_series_is_hollow(const StkSeries *fresh, const StkSeries *held)
+{
+  g_return_val_if_fail(fresh != NULL, FALSE);
+  return fresh->range == STK_RANGE_1D && fresh->n_points == 0 && held != NULL &&
+         held->range == STK_RANGE_1D && held->n_points > 0;
 }
