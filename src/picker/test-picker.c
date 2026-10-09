@@ -525,6 +525,15 @@ test_filters(void)
   gtk_drop_down_set_selected(kind, 0);
   assert_symbols(p, "stk-picker-catalog", "AAA BBB CCC DDD EEE", 5);
 
+  /* "Indices" is the 4th position; the fixture catalog has no index */
+  GListModel *kinds = gtk_drop_down_get_model(kind);
+  g_assert_cmpuint(g_list_model_get_n_items(kinds), ==, 4);
+  g_assert_cmpstr(gtk_string_list_get_string(GTK_STRING_LIST(kinds), 3), ==, "Indices");
+  gtk_drop_down_set_selected(kind, 3);
+  assert_symbols(p, "stk-picker-catalog", "", 0);
+  gtk_drop_down_set_selected(kind, 0);
+  assert_symbols(p, "stk-picker-catalog", "AAA BBB CCC DDD EEE", 5);
+
   /* category filter (exact category) */
   gtk_drop_down_set_selected(cat, 1);
   assert_symbols(p, "stk-picker-catalog", "CCC DDD", 2);
@@ -1129,12 +1138,13 @@ test_results_and_toggle(void)
   g_string_free(name, TRUE);
   hits_add(hits, "ctrl", "A\tB\nC\x01", STK_KIND_STOCK);
   hits_add(hits, "BBB", "Beta (also in catalog)", STK_KIND_ETF);
+  hits_add(hits, "^SPX", "Some Index", STK_KIND_INDEX); /* accepted, labelled "Index" */
   fake_complete(fx.fake, 0, hits);
 
   WAIT_FOR(results_visible(p));
   g_assert_false(status_visible(p));
-  g_assert_cmpuint(list_n_items(p, "stk-picker-results"), ==, 6);
-  assert_symbols(p, "stk-picker-results", "BBB CTRL FXAIX LONGN MSFT VTI", 6);
+  g_assert_cmpuint(list_n_items(p, "stk-picker-results"), ==, 7);
+  assert_symbols(p, "stk-picker-results", "BBB CTRL FXAIX LONGN MSFT VTI ^SPX", 7);
   GtkWidget *t = find_toggle(p, "stk-picker-results", "MSFT");
   g_assert_cmpstr(row_label(t, 2), ==, "Stock");
   g_assert_cmpstr(row_label(t, 0), ==, "Microsoft Corp");
@@ -1142,6 +1152,7 @@ test_results_and_toggle(void)
       gtk_widget_get_next_sibling(gtk_widget_get_next_sibling(t))))); /* no category */
   g_assert_cmpstr(row_label(find_toggle(p, "stk-picker-results", "VTI"), 2), ==, "ETF");
   g_assert_cmpstr(row_label(find_toggle(p, "stk-picker-results", "FXAIX"), 2), ==, "Fund");
+  g_assert_cmpstr(row_label(find_toggle(p, "stk-picker-results", "^SPX"), 2), ==, "Index");
 
   /* toggling adds with the provider-reported kind */
   gtk_check_button_set_active(GTK_CHECK_BUTTON(t), TRUE);

@@ -54,6 +54,21 @@ G_BEGIN_DECLS
 gboolean stk_chart_geom_is_up(const double *v, gsize n);
 
 /**
+ * stk_chart_geom_is_up_vs_close:
+ * @v: (nullable): @n values; may be NULL only when @n is 0.
+ * @n: number of values.
+ * @prev_close: the previous close, or a non-finite value (NaN, +inf, -inf)
+ *   when there is none.
+ *
+ * Direction of a 1D chart as the detail header and list row show it. When
+ * @prev_close is finite, returns TRUE if the last value is >= @prev_close
+ * (equality counts as up; a single value is compared too); n == 0 returns
+ * TRUE. When @prev_close is not finite, returns exactly
+ * stk_chart_geom_is_up(@v, @n) (last value >= first value).
+ */
+gboolean stk_chart_geom_is_up_vs_close(const double *v, gsize n, double prev_close);
+
+/**
  * stk_chart_geom_domain:
  * @range: the series range.
  * @t: (nullable): @n ascending timestamps; may be NULL only when @n is 0.

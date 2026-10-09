@@ -95,6 +95,8 @@ kind_label(StkKind kind)
     return "ETF";
   case STK_KIND_FUND:
     return "Fund";
+  case STK_KIND_INDEX:
+    return "Index";
   }
   return "";
 }
@@ -102,7 +104,8 @@ kind_label(StkKind kind)
 static gboolean
 kind_is_valid(StkKind kind)
 {
-  return kind == STK_KIND_STOCK || kind == STK_KIND_ETF || kind == STK_KIND_FUND;
+  return kind == STK_KIND_STOCK || kind == STK_KIND_ETF || kind == STK_KIND_FUND ||
+         kind == STK_KIND_INDEX;
 }
 
 /* Returns a newly allocated copy of the text of @entry without surrounding
@@ -425,6 +428,7 @@ refilter(StkPicker *self)
   guint kind_index = gtk_drop_down_get_selected(GTK_DROP_DOWN(self->kind_dropdown));
   StkCatalogKindFilter kind = kind_index == 1   ? STK_CATALOG_FILTER_ETF
                               : kind_index == 2 ? STK_CATALOG_FILTER_FUND
+                              : kind_index == 3 ? STK_CATALOG_FILTER_INDEX
                                                 : STK_CATALOG_FILTER_ALL;
 
   const char *category = NULL;
@@ -732,7 +736,7 @@ stk_picker_init(StkPicker *self)
   gtk_box_append(GTK_BOX(root), self->filter_entry);
 
   GtkWidget *drops = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-  const char *const kinds[] = { "All kinds", "ETFs", "Mutual funds", NULL };
+  const char *const kinds[] = { "All kinds", "ETFs", "Mutual funds", "Indices", NULL };
   self->kind_dropdown = gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(kinds)), NULL);
   gtk_widget_set_name(self->kind_dropdown, "stk-picker-kind");
   gtk_accessible_update_property(GTK_ACCESSIBLE(self->kind_dropdown),

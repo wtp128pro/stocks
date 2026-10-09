@@ -721,7 +721,8 @@ stk_chart_set_series(StkChart *self, StkSeries *series)
   }
 
   if (self->has_data)
-    set_direction_class(self, stk_chart_geom_is_up(self->v, self->win_n) ? "positive" : "negative");
+    set_direction_class(self, stk_chart_geom_is_up_vs_close(self->v, self->win_n, self->prev_close)
+                                  ? "positive" : "negative");
   else
     set_direction_class(self, NULL);
 

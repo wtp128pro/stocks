@@ -94,6 +94,16 @@ stk_chart_geom_is_up(const double *v, gsize n)
 }
 
 gboolean
+stk_chart_geom_is_up_vs_close(const double *v, gsize n, double prev_close)
+{
+  if (n == 0)
+    return TRUE;
+  if (isfinite(prev_close))
+    return v[n - 1] >= prev_close;
+  return stk_chart_geom_is_up(v, n);
+}
+
+gboolean
 stk_chart_geom_domain(StkRange range, const double *t, gsize n, double *t0, double *t1)
 {
   if (n == 0)

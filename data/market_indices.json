@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "generated": "2026-10-09",
+  "sources": [
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5EDJI",
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5EIXIC",
+    "https://query1.finance.yahoo.com/v8/finance/chart/%5ERUT"
+  ],
+  "items": [
+    {"symbol": "^DJI", "name": "Dow Jones Industrial Average", "kind": "index", "category": "Market indices"},
+    {"symbol": "^GSPC", "name": "S&P 500", "kind": "index", "category": "Market indices"},
+    {"symbol": "^IXIC", "name": "Nasdaq Composite", "kind": "index", "category": "Market indices"},
+    {"symbol": "^RUT", "name": "Russell 2000", "kind": "index", "category": "Market indices"}
+  ]
+}

@@ -3,9 +3,10 @@
  *
  * A GObject interface with three asynchronous GIO-style operations (quote,
  * chart series, symbol search). Every other module obtains market data
- * exclusively through this interface; StkNasdaq (stk-nasdaq.h) is its only
- * implementation, so the unofficial data source can be swapped by writing
- * another implementation.
+ * exclusively through this interface. StkNasdaq (stk-nasdaq.h) serves stocks,
+ * ETFs and mutual funds; StkYahoo (stk-yahoo.h) serves the market indices
+ * (STK_KIND_INDEX); StkRouter (stk-router.h) combines the two. Another data
+ * source is added by writing another implementation.
  *
  * Contract shared by all operations
  * ---------------------------------
@@ -37,7 +38,7 @@
  *    price (the last official price for funds); unknown numeric fields are
  *    NAN. quote->kind equals the requested kind and quote->symbol equals the
  *    requested symbol (upper-cased), never a string taken from the response.
- *  - StkSeries for STK_RANGE_1D (stocks and ETFs only): one point per
+ *  - StkSeries for STK_RANGE_1D (stocks, ETFs and indices only): one point per
  *    provider sample inside the regular session of the trading day the
  *    provider reports, t_ms being the true UTC instant; the session window
  *    is half-open [open, close) because the provider labels each minute
@@ -147,8 +148,8 @@ StkQuote *stk_provider_fetch_quote_finish(StkProvider *self, GAsyncResult *resul
  * @self: a StkProvider.
  * @symbol: non-NULL ticker; must satisfy stk_symbol_is_valid().
  * @kind: the instrument's stored class (see stk_provider_fetch_quote_async()).
- * @range: chart range. STK_RANGE_1D is only valid for STK_KIND_STOCK and
- *   STK_KIND_ETF: STK_KIND_FUND with STK_RANGE_1D, and an invalid range
+ * @range: chart range. STK_RANGE_1D is only valid for STK_KIND_STOCK,
+ *   STK_KIND_ETF and STK_KIND_INDEX: STK_KIND_FUND with STK_RANGE_1D, and an invalid range
  *   value, are reported as STK_ERROR_INVALID_ARG without network traffic.
  * @cancellable: (nullable): cancels the operation.
  * @callback: invoked once, in the thread-default main context of the caller.

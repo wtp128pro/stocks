@@ -1000,6 +1000,54 @@ remove_tree(const char *root)
   g_free(themes);
 }
 
+/* Direction is checked synchronously after set_series: no pump, no snapshot. */
+static StkSeries *
+make_values(StkRange range, double prev_close, const double *v, int n)
+{
+  StkSeries *s = stk_series_new(range, prev_close, (gsize)n);
+  gint64 t0 = range == STK_RANGE_1D ? utc_ms(2026, 10, 8, 13, 30) : utc_ms(2026, 9, 1, 0, 0);
+  gint64 step = range == STK_RANGE_1D ? 60000 : 86400000;
+  for (int i = 0; i < n; i++)
+    g_assert_true(stk_series_append(s, t0 + i * step, v[i]));
+  return s;
+}
+
+static void
+test_chart_direction_vs_prev_close(void)
+{
+  double fade[3] = { 105.0, 99.0, 102.0 };   /* first > last >= prev 100 */
+  double recover[3] = { 95.0, 101.0, 98.0 }; /* first < last < prev 100 */
+  Fixture f = fixture_new(stk_chart_new());
+  StkChart *c = STK_CHART(f.widget);
+
+  StkSeries *s = make_values(STK_RANGE_1D, 100.0, fade, 3);
+  stk_chart_set_series(c, s);
+  g_assert_true(gtk_widget_has_css_class(f.widget, "positive"));
+  g_assert_false(gtk_widget_has_css_class(f.widget, "negative"));
+  stk_series_unref(s);
+
+  s = make_values(STK_RANGE_1D, 100.0, recover, 3);
+  stk_chart_set_series(c, s);
+  g_assert_true(gtk_widget_has_css_class(f.widget, "negative"));
+  g_assert_false(gtk_widget_has_css_class(f.widget, "positive"));
+  stk_series_unref(s);
+
+  /* Same values as 1M: last-vs-first. */
+  s = make_values(STK_RANGE_1M, 100.0, fade, 3);
+  stk_chart_set_series(c, s);
+  g_assert_true(gtk_widget_has_css_class(f.widget, "negative"));
+  g_assert_false(gtk_widget_has_css_class(f.widget, "positive"));
+  stk_series_unref(s);
+
+  s = make_values(STK_RANGE_1M, 100.0, recover, 3);
+  stk_chart_set_series(c, s);
+  g_assert_true(gtk_widget_has_css_class(f.widget, "positive"));
+  g_assert_false(gtk_widget_has_css_class(f.widget, "negative"));
+  stk_series_unref(s);
+
+  fixture_free(&f);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1033,6 +1081,7 @@ main(int argc, char **argv)
   g_test_add_func("/chart-widget/chart/idle-and-redraw", test_chart_idle_and_redraw);
   g_test_add_func("/chart-widget/sparkline", test_sparkline);
   g_test_add_func("/chart-widget/sparkline/huge-and-dispose", test_sparkline_huge);
+  g_test_add_func("/chart-widget/chart/direction-vs-prev-close", test_chart_direction_vs_prev_close);
   g_test_add_func("/chart-widget/in-box", test_in_box);
   int rc = g_test_run();
   remove_tree(tmp_root);

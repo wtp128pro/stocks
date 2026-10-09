@@ -24,8 +24,11 @@
  * ranges ignore prev_close). All other ranges span first..last sample.
  *
  * Colour: the widget carries the CSS node name "stk-chart" and the CSS class
- * "positive" when the last drawn sample is >= the first, "negative"
- * otherwise. The line/fill/crosshair colour is the CSS `color` of the widget,
+ * "positive" when the chart is up, "negative" otherwise. For STK_RANGE_1D
+ * with a finite prev_close the chart is up when the last drawn sample is >=
+ * the previous close, which matches the change shown in the detail header and
+ * list row; otherwise it is up when the last drawn sample is >= the first. The
+ * line/fill/crosshair colour is the CSS `color` of the widget,
  * so applications theme it with e.g.
  *     stk-chart.positive { color: #26a269; }
  *     stk-chart.negative { color: #c01c28; }

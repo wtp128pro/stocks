@@ -34,6 +34,7 @@ typedef struct {
   StkRange req_range;      /* series request only */
   gboolean req_for_detail; /* series request started for the DETAIL job */
   gboolean req_cancelling;
+  StkKind req_kind;        /* kind the request was issued with (see n_inflight_index) */
 } Entry;
 
 struct _StkScheduler {
@@ -44,6 +45,7 @@ struct _StkScheduler {
   gboolean visible;
   gboolean online;
   guint n_inflight;
+  guint n_inflight_index; /* outstanding requests issued with kind STK_KIND_INDEX */
   guint64 next_id;
   gint64 deadline_us; /* -1: none */
   gboolean has_last;
@@ -204,6 +206,9 @@ start_request(StkScheduler *self, Entry *e, gboolean is_quote, StkRange range, g
       e->wants &= ~(guint)WANT_DETAIL;
   }
   self->n_inflight++;
+  e->req_kind = a.kind;
+  if (a.kind == STK_KIND_INDEX)
+    self->n_inflight_index++;
   emit(self, &a);
 }
 
@@ -217,6 +222,9 @@ start_next(StkScheduler *self)
     for (guint i = 0; i < self->entries->len; i++) {
       Entry *e = g_ptr_array_index(self->entries, i);
       if (e->removed || e->req_id != 0)
+        continue;
+      /* The index slot is taken: this job stays wanted, the others go on. */
+      if (e->kind == STK_KIND_INDEX && self->n_inflight_index >= STK_SCHED_MAX_INFLIGHT_INDEX)
         continue;
       gboolean sel = is_selected(self, e);
       switch (pass) {
@@ -625,6 +633,8 @@ stk_scheduler_request_done(StkScheduler *self, StkSchedTime now, guint64 id, Stk
   e->req_id = 0;
   e->req_cancelling = FALSE;
   self->n_inflight--;
+  if (e->req_kind == STK_KIND_INDEX)
+    self->n_inflight_index--;
   if (e->removed)
     g_ptr_array_remove(self->entries, e);
   finish(self, now);

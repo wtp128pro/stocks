@@ -5,8 +5,10 @@
  * scheduler with a fake StkSchedTime. The fixture checks, after every call,
  * the invariants that must hold at all times: at most one outstanding request
  * per symbol (cancelled ones included), at most STK_SCHED_MAX_INFLIGHT in
- * total, unique non-zero ids, CANCEL only for outstanding requests, and no
- * 1D series for a fund.
+ * total, at most STK_SCHED_MAX_INFLIGHT_INDEX of them issued with kind
+ * STK_KIND_INDEX (the kind of the action, not the symbol's current kind),
+ * unique non-zero ids, CANCEL only for outstanding requests, and no 1D series
+ * for a fund.
  *
  * The /scheduler/regress/ tests pin the defects found by the panel review:
  * freshness is per job (a job that was cancelled, dropped or failed is never
@@ -34,6 +36,7 @@ typedef struct {
   guint64 id;
   char symbol[STK_SCHED_SYMBOL_BYTES];
   gboolean cancelled;
+  StkKind kind; /* kind the request was issued with */
 } Outstanding;
 
 typedef struct {
@@ -98,6 +101,7 @@ collect(Fx *fx)
       memset(&o, 0, sizeof o);
       o.id = a.id;
       g_strlcpy(o.symbol, a.symbol, sizeof o.symbol);
+      o.kind = a.kind;
       for (guint j = 0; j < fx->out->len; j++) {
         const Outstanding *p = &g_array_index(fx->out, Outstanding, j);
         g_assert_cmpuint(p->id, !=, a.id);
@@ -109,6 +113,10 @@ collect(Fx *fx)
         g_assert_cmpint(a.range, !=, STK_RANGE_1D);
       g_array_append_val(fx->out, o);
       g_assert_cmpuint(fx->out->len, <=, STK_SCHED_MAX_INFLIGHT);
+      guint n_index = 0;
+      for (guint j = 0; j < fx->out->len; j++)
+        n_index += g_array_index(fx->out, Outstanding, j).kind == STK_KIND_INDEX;
+      g_assert_cmpuint(n_index, <=, STK_SCHED_MAX_INFLIGHT_INDEX);
     }
   }
   g_assert_cmpuint(stk_scheduler_n_inflight(fx->s), ==, fx->out->len);
@@ -911,6 +919,27 @@ test_fund_has_no_1d_detail(void)
   fx_advance(fx, 600);
   fx_focus(fx); /* an event round must not request 1D either */
   fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_free(fx);
+}
+
+/* An index takes the stock path: quote, sparkline and a 1D detail series, and
+ * its quote is part of the periodic round (unlike a healthy fund). */
+static void
+test_index_behaves_like_stock(void)
+{
+  const StkSchedSymbol idx[] = {{"^GSPC", STK_KIND_INDEX}};
+  Fx *fx = fx_new(WALL_OPEN);
+  fx_symbols(fx, idx, 1);
+  fx_online(fx, TRUE);
+  fx_visible(fx, TRUE);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "^GSPC", -1), ==, 1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_select(fx, "^GSPC", STK_RANGE_1D);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_SERIES, "^GSPC", STK_RANGE_1D), ==, 1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_advance(fx, 60);
+  fx_tick(fx);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "^GSPC", -1), ==, 1);
   fx_free(fx);
 }
 
@@ -1765,6 +1794,348 @@ test_hollow_series_policy(void)
   g_assert_false(stk_sched_series_is_hollow(empty_1d, full_1y));
 }
 
+/* ------------------------------------------------------------------------ */
+/* Index slot (STK_SCHED_MAX_INFLIGHT_INDEX)                                */
+/* ------------------------------------------------------------------------ */
+
+/* Requests issued with kind STK_KIND_INDEX in (fx)->all from @from on. */
+static guint
+index_fetches_since(const Fx *fx, guint from)
+{
+  guint n = 0;
+  for (guint i = from; i < fx->all->len; i++) {
+    const StkSchedAction *a = &g_array_index(fx->all, StkSchedAction, i);
+    if (a->type != STK_SCHED_CANCEL && a->kind == STK_KIND_INDEX)
+      n++;
+  }
+  return n;
+}
+
+static guint64
+index_out_id(const Fx *fx)
+{
+  for (guint j = 0; j < fx->out->len; j++) {
+    const Outstanding *o = &g_array_index(fx->out, Outstanding, j);
+    if (o->kind == STK_KIND_INDEX)
+      return o->id;
+  }
+  return 0;
+}
+
+static const StkSchedSymbol k_idx_first[] = {
+    {"^GSPC", STK_KIND_INDEX}, {"^DJI", STK_KIND_INDEX}, {"^IXIC", STK_KIND_INDEX},
+    {"^RUT", STK_KIND_INDEX},  {"AAPL", STK_KIND_STOCK}, {"MSFT", STK_KIND_STOCK},
+    {"SPY", STK_KIND_ETF},     {"FXAIX", STK_KIND_FUND}};
+static const char *const k_idx_names[] = {"^GSPC", "^DJI", "^IXIC", "^RUT"};
+static const char *const k_plain_names[] = {"AAPL", "MSFT", "SPY", "FXAIX"};
+
+/* (a) The Sev-2 regression: four indices listed before the stocks, an event
+ * round, and the index request never completes (unreachable index source).
+ * Returns the fixture with every non-index job issued and completed OK and
+ * only the first index quote still outstanding. */
+static Fx *
+fx_index_stuck(void)
+{
+  Fx *fx = fx_new(WALL_OPEN);
+  fx_symbols(fx, k_idx_first, G_N_ELEMENTS(k_idx_first));
+  fx_online(fx, TRUE);
+  fx_visible(fx, TRUE);
+
+  /* First batch: exactly 1 index FETCH and 3 non-index FETCHes. */
+  g_assert_nonnull(fx->last);
+  g_assert_cmpuint(fx->last->len, ==, STK_SCHED_MAX_INFLIGHT);
+  g_assert_cmpuint(index_fetches_since(fx, 0), ==, STK_SCHED_MAX_INFLIGHT_INDEX);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "^GSPC", -1), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "AAPL", -1), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "MSFT", -1), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "SPY", -1), ==, 1);
+  guint64 index_id = index_out_id(fx);
+  g_assert_cmpuint(index_id, !=, 0);
+
+  /* Non-index requests complete one by one; each frees a slot that the next
+   * non-index job takes, never a second index request. */
+  for (guint guard = 0; fx->out->len > 1; guard++) {
+    g_assert_cmpuint(guard, <, 100);
+    for (guint j = 0; j < fx->out->len; j++) {
+      const Outstanding *o = &g_array_index(fx->out, Outstanding, j);
+      if (o->kind != STK_KIND_INDEX) {
+        fx_done(fx, o->id, STK_SCHED_RESULT_OK);
+        break;
+      }
+    }
+    g_assert_cmpuint(index_fetches_since(fx, 0), ==, 1);
+    g_assert_cmpuint(index_out_id(fx), ==, index_id);
+  }
+  g_assert_cmpuint(fx->out->len, ==, 1);
+  for (guint i = 0; i < G_N_ELEMENTS(k_plain_names); i++) {
+    g_assert_cmpuint(COUNT_ALL(fx, STK_SCHED_FETCH_QUOTE, k_plain_names[i], -1), ==, 1);
+    g_assert_cmpuint(COUNT_ALL(fx, STK_SCHED_FETCH_SERIES, k_plain_names[i], STK_RANGE_1M), ==, 1);
+    g_assert_cmpuint(COUNT_OK(fx, STK_SCHED_FETCH_QUOTE, k_plain_names[i], -1), ==, 1);
+    g_assert_cmpuint(COUNT_OK(fx, STK_SCHED_FETCH_SERIES, k_plain_names[i], STK_RANGE_1M), ==, 1);
+  }
+  /* The blocked index jobs were neither issued, failed nor forgotten. */
+  for (guint i = 0; i < G_N_ELEMENTS(k_idx_names); i++)
+    g_assert_false(stk_scheduler_is_stale(fx->s, k_idx_names[i]));
+  g_assert_cmpuint(COUNT_ALL(fx, STK_SCHED_FETCH_QUOTE, "^DJI", -1), ==, 0);
+  return fx;
+}
+
+static void
+test_index_slot_never_starves_others(void)
+{
+  Fx *fx = fx_index_stuck();
+  /* Still stuck, another event round: the stock jobs refresh, the index
+   * request is merged and the blocked index jobs stay blocked. */
+  fx_advance(fx, 10);
+  fx_focus(fx);
+  g_assert_cmpuint(index_fetches_since(fx, 0), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "AAPL", -1), ==, 1);
+  fx_free(fx);
+}
+
+/* (b) When the index request completes the next index job starts, and the
+ * selected index comes first. */
+static void
+test_index_next_job_and_selection_first(void)
+{
+  Fx *fx = fx_index_stuck();
+  guint mark = fx->all->len;
+  fx_select(fx, "^RUT", STK_RANGE_1D);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0); /* the slot is taken */
+  g_assert_cmpuint(fx->out->len, ==, 1);
+
+  fx_done(fx, index_out_id(fx), STK_SCHED_RESULT_OK);
+  /* Exactly one index request per completion, in priority order: the
+   * selection's QUOTE, its DETAIL, the other QUOTEs, then the SPARKs. */
+  struct {
+    StkSchedActionType type;
+    const char *symbol;
+    StkRange range;
+  } expect[] = {
+      {STK_SCHED_FETCH_QUOTE, "^RUT", STK_RANGE_1D},   {STK_SCHED_FETCH_SERIES, "^RUT", STK_RANGE_1D},
+      {STK_SCHED_FETCH_QUOTE, "^DJI", STK_RANGE_1D},   {STK_SCHED_FETCH_QUOTE, "^IXIC", STK_RANGE_1D},
+      {STK_SCHED_FETCH_SERIES, "^GSPC", STK_RANGE_1M}, {STK_SCHED_FETCH_SERIES, "^DJI", STK_RANGE_1M},
+      {STK_SCHED_FETCH_SERIES, "^IXIC", STK_RANGE_1M}, {STK_SCHED_FETCH_SERIES, "^RUT", STK_RANGE_1M}};
+  for (guint i = 0; i < G_N_ELEMENTS(expect); i++) {
+    g_assert_nonnull(fx->last);
+    g_assert_cmpuint(fx->last->len, ==, 1);
+    const StkSchedAction *a = &g_array_index(fx->last, StkSchedAction, 0);
+    g_assert_cmpint(a->type, ==, expect[i].type);
+    g_assert_cmpstr(a->symbol, ==, expect[i].symbol);
+    g_assert_cmpint(a->range, ==, expect[i].range);
+    g_assert_cmpuint(a->kind, ==, STK_KIND_INDEX);
+    g_assert_cmpuint(fx->out->len, ==, 1);
+    fx_done(fx, a->id, STK_SCHED_RESULT_OK);
+  }
+  NO_ACTIONS(fx);
+  g_assert_cmpuint(fx->out->len, ==, 0);
+  g_assert_cmpuint(index_fetches_since(fx, 0), ==, 1 + G_N_ELEMENTS(expect));
+  fx_free(fx);
+}
+
+/* (c) Hiding cancels the index request; showing again before it is reported
+ * done issues no second index FETCH until request_done. */
+static void
+test_index_hide_show_waits_for_done(void)
+{
+  const StkSchedSymbol syms[] = {
+      {"^GSPC", STK_KIND_INDEX}, {"^DJI", STK_KIND_INDEX}, {"AAPL", STK_KIND_STOCK}};
+  Fx *fx = fx_new(WALL_OPEN);
+  fx_symbols(fx, syms, G_N_ELEMENTS(syms));
+  fx_online(fx, TRUE);
+  fx_visible(fx, TRUE);
+  guint64 index_id = index_out_id(fx);
+  g_assert_cmpuint(index_id, !=, 0);
+  g_assert_cmpuint(index_fetches_since(fx, 0), ==, 1);
+
+  fx_visible(fx, FALSE);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_CANCEL, NULL, -1), ==, fx->out->len);
+  fx_done(fx, out_id(fx, "AAPL"), STK_SCHED_RESULT_CANCELLED);
+  g_assert_cmpuint(fx->out->len, ==, 1); /* the cancelled index request keeps its slot */
+
+  guint mark = fx->all->len;
+  fx_visible(fx, TRUE);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "AAPL", -1), ==, 1);
+  fx_focus(fx); /* another event round: still no second index request */
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+
+  fx_done(fx, index_id, STK_SCHED_RESULT_CANCELLED);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "^GSPC", -1), ==, 1);
+  fx_free(fx);
+}
+
+/* (d) Removing an index symbol while its request is in flight still blocks
+ * the other index jobs until the request is reported done. */
+static void
+test_index_removed_symbol_keeps_the_slot(void)
+{
+  const StkSchedSymbol before[] = {
+      {"^GSPC", STK_KIND_INDEX}, {"^DJI", STK_KIND_INDEX}, {"AAPL", STK_KIND_STOCK}};
+  const StkSchedSymbol after[] = {{"^DJI", STK_KIND_INDEX}, {"AAPL", STK_KIND_STOCK}};
+  Fx *fx = fx_new(WALL_OPEN);
+  fx_symbols(fx, before, G_N_ELEMENTS(before));
+  fx_online(fx, TRUE);
+  fx_visible(fx, TRUE);
+  guint64 gspc = out_id(fx, "^GSPC");
+  g_assert_cmpuint(gspc, !=, 0);
+
+  guint mark = fx->all->len;
+  fx_symbols(fx, after, G_N_ELEMENTS(after));
+  g_assert_cmpuint(COUNT_SINCE(fx, mark, STK_SCHED_CANCEL, NULL, -1), ==, 1);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+  fx_advance(fx, 10);
+  fx_focus(fx);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+
+  fx_done(fx, gspc, STK_SCHED_RESULT_CANCELLED);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "^DJI", -1), ==, 1);
+  fx_free(fx);
+}
+
+/* (e) Changing the kind of an entry between STOCK and INDEX while its request
+ * is in flight never allows 2 outstanding index requests: the request is
+ * counted by the kind it was issued with. */
+static void
+test_index_kind_change_in_flight(void)
+{
+  const StkSchedSymbol start[] = {
+      {"^GSPC", STK_KIND_INDEX}, {"^DJI", STK_KIND_INDEX}, {"AAPL", STK_KIND_STOCK}};
+  const StkSchedSymbol flipped[] = {
+      {"^GSPC", STK_KIND_STOCK}, {"^DJI", STK_KIND_INDEX}, {"AAPL", STK_KIND_INDEX}};
+  Fx *fx = fx_new(WALL_OPEN);
+  fx_symbols(fx, start, G_N_ELEMENTS(start));
+  fx_online(fx, TRUE);
+  fx_visible(fx, TRUE);
+  guint64 gspc = out_id(fx, "^GSPC");
+  guint64 aapl = out_id(fx, "AAPL");
+  g_assert_cmpuint(gspc, !=, 0);
+  g_assert_cmpuint(aapl, !=, 0);
+
+  /* ^GSPC (issued as INDEX) is now a STOCK, AAPL (issued as STOCK) an INDEX. */
+  guint mark = fx->all->len;
+  fx_symbols(fx, flipped, G_N_ELEMENTS(flipped));
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+
+  /* The old index request ends: exactly one of the indices may start. AAPL
+   * is still busy with its stock-issued request, so it is ^DJI. */
+  fx_done(fx, gspc, STK_SCHED_RESULT_OK);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 1);
+  g_assert_cmpuint(COUNT_LAST(fx, STK_SCHED_FETCH_QUOTE, "^DJI", -1), ==, 1);
+
+  /* The stock-issued AAPL request ends: AAPL is an INDEX now and must wait
+   * for ^DJI. */
+  mark = fx->all->len;
+  fx_done(fx, aapl, STK_SCHED_RESULT_OK);
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+
+  /* Flip back while ^DJI is in flight: AAPL is a STOCK again and may start,
+   * ^DJI (now a STOCK, issued as INDEX) still holds the index slot. */
+  const StkSchedSymbol back[] = {
+      {"^GSPC", STK_KIND_INDEX}, {"^DJI", STK_KIND_STOCK}, {"AAPL", STK_KIND_STOCK}};
+  fx_symbols(fx, back, G_N_ELEMENTS(back));
+  g_assert_cmpuint(index_fetches_since(fx, mark), ==, 0);
+  g_assert_cmpuint(COUNT_SINCE(fx, mark, STK_SCHED_FETCH_SERIES, "AAPL", -1), ==, 1);
+  fx_finish_all(fx, STK_SCHED_RESULT_OK);
+  fx_free(fx);
+}
+
+/* (f) over randomised input: the fixture asserts, after every call, at most
+ * STK_SCHED_MAX_INFLIGHT outstanding requests and at most
+ * STK_SCHED_MAX_INFLIGHT_INDEX of them issued as INDEX, while symbols change
+ * kind, appear, disappear, and requests succeed, fail or are cancelled. */
+static void
+test_index_random_inputs_keep_invariants(void)
+{
+  static const char *const names[] = {"^GSPC", "^DJI", "^IXIC", "^RUT",
+                                      "AAPL",  "MSFT", "SPY",   "FXAIX"};
+  const gint64 starts[] = {WALL_OPEN, WALL_AFTER_HOURS};
+  for (guint seed = 1; seed <= 80; seed++) {
+    g_test_message("seed %u", seed);
+    GRand *rnd = g_rand_new_with_seed(seed);
+    Fx *fx = fx_new(starts[seed % G_N_ELEMENTS(starts)]);
+    gboolean visible = FALSE;
+    gboolean online = FALSE;
+
+    for (guint step = 0; step < 400; step++) {
+      fx_advance(fx, g_rand_int_range(rnd, 0, 4));
+      switch (g_rand_int_range(rnd, 0, 10)) {
+      case 0: {
+        StkSchedSymbol list[G_N_ELEMENTS(names)];
+        gsize n = 0;
+        for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
+          if (g_rand_boolean(rnd))
+            continue;
+          gboolean index = names[i][0] == '^';
+          if (g_rand_int_range(rnd, 0, 4) == 0)
+            index = !index; /* the kind changes under a request in flight */
+          list[n].symbol = names[i];
+          list[n].kind = index ? STK_KIND_INDEX : (i % 2 ? STK_KIND_ETF : STK_KIND_STOCK);
+          n++;
+        }
+        fx_symbols(fx, list, n);
+        break;
+      }
+      case 1: {
+        guint pick = (guint)g_rand_int_range(rnd, 0, G_N_ELEMENTS(names) + 1);
+        StkRange range = (StkRange)g_rand_int_range(rnd, STK_RANGE_1D, STK_RANGE_1Y + 1);
+        fx_select(fx, pick < G_N_ELEMENTS(names) ? names[pick] : NULL, range);
+        break;
+      }
+      case 2:
+        visible = !visible;
+        fx_visible(fx, visible);
+        break;
+      case 3:
+        online = !online;
+        fx_online(fx, online);
+        break;
+      case 4:
+        fx_focus(fx);
+        break;
+      case 5:
+        fx_advance(fx, g_rand_int_range(rnd, 0, 90));
+        fx_tick(fx);
+        break;
+      default:
+        if (fx->out->len > 0) {
+          Outstanding o =
+              g_array_index(fx->out, Outstanding, g_rand_int_range(rnd, 0, fx->out->len));
+          fx_done(fx, o.id,
+                  o.cancelled ? STK_SCHED_RESULT_CANCELLED
+                              : (g_rand_int_range(rnd, 0, 10) < 7 ? STK_SCHED_RESULT_OK
+                                                                  : STK_SCHED_RESULT_FAILED));
+        }
+        break;
+      }
+    }
+
+    /* Everything listed, one more event round, every request succeeds: every
+     * job arrives, the indices one at a time, and nothing stays stale. */
+    StkSchedSymbol all[G_N_ELEMENTS(names)];
+    for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
+      all[i].symbol = names[i];
+      all[i].kind = names[i][0] == '^' ? STK_KIND_INDEX : STK_KIND_STOCK;
+    }
+    fx_symbols(fx, all, G_N_ELEMENTS(all));
+    fx_visible(fx, TRUE);
+    fx_online(fx, TRUE);
+    fx_advance(fx, 10);
+    guint ok_mark = fx->oks->len;
+    fx_focus(fx);
+    fx_finish_all_sane(fx);
+    g_assert_cmpuint(stk_scheduler_n_inflight(fx->s), ==, 0);
+    for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
+      g_assert_false(stk_scheduler_is_stale(fx->s, names[i]));
+      g_assert_cmpuint(count_from(fx->oks, ok_mark, STK_SCHED_FETCH_QUOTE, names[i], -1), >=, 1);
+    }
+    fx_free(fx);
+    g_rand_free(rnd);
+  }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1789,6 +2160,7 @@ main(int argc, char **argv)
   g_test_add_func("/scheduler/selection", test_selection_detail_and_cancel_on_range_change);
   g_test_add_func("/scheduler/sparkline-request", test_sparkline_request_survives_range_change);
   g_test_add_func("/scheduler/fund-no-1d", test_fund_has_no_1d_detail);
+  g_test_add_func("/scheduler/index-like-stock", test_index_behaves_like_stock);
   g_test_add_func("/scheduler/symbol-set", test_symbol_set_changes);
   g_test_add_func("/scheduler/input-validation", test_input_validation);
   g_test_add_func("/scheduler/clock/forward", test_clock_forward_jump_makes_deadline_due);
@@ -1814,5 +2186,12 @@ main(int argc, char **argv)
                   test_selection_change_drops_detail_stale_mark);
   g_test_add_func("/scheduler/regress/random", test_random_inputs_keep_invariants);
   g_test_add_func("/scheduler/regress/hollow-1d-series", test_hollow_series_policy);
+  g_test_add_func("/scheduler/index/never-starves-others", test_index_slot_never_starves_others);
+  g_test_add_func("/scheduler/index/next-job-selection-first",
+                  test_index_next_job_and_selection_first);
+  g_test_add_func("/scheduler/index/hide-show", test_index_hide_show_waits_for_done);
+  g_test_add_func("/scheduler/index/removed-keeps-slot", test_index_removed_symbol_keeps_the_slot);
+  g_test_add_func("/scheduler/index/kind-change", test_index_kind_change_in_flight);
+  g_test_add_func("/scheduler/index/random", test_index_random_inputs_keep_invariants);
   return g_test_run();
 }

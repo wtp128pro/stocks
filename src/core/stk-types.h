@@ -36,11 +36,17 @@ GQuark stk_error_quark(void);
 /* Enumerations                                                             */
 /* ------------------------------------------------------------------------ */
 
-/** Instrument class. Selects the provider's `assetclass` (never guessed). */
+/**
+ * Instrument class. Selects the provider's `assetclass` (never guessed).
+ * Persisted as the tokens of stk_kind_to_string(); new kinds are only ever
+ * appended, so existing enumerator values and tokens never change.
+ */
 typedef enum {
   STK_KIND_STOCK,
   STK_KIND_ETF,
-  STK_KIND_FUND /**< mutual fund: NAV once per day, no intraday data */
+  STK_KIND_FUND, /**< mutual fund: NAV once per day, no intraday data */
+  STK_KIND_INDEX /**< market index (e.g. ^GSPC): a level, not a tradable price;
+                      behaves like a stock for ranges (1D intraday + daily) */
 } StkKind;
 
 /** Chart range. STK_RANGE_1Y is the "12 months" range. */
@@ -56,7 +62,8 @@ typedef enum {
  * stk_kind_to_string:
  * @kind: a valid StkKind.
  *
- * Returns: static, stable persistence token: "stock", "etf" or "fund".
+ * Returns: static, stable persistence token: "stock", "etf", "fund" or
+ *   "index".
  *   Never NULL; do not free.
  */
 const char *stk_kind_to_string(StkKind kind);

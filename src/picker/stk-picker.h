@@ -3,7 +3,7 @@
  * symbols online and add/remove instruments of the watchlist.
  *
  * Layout (top to bottom): a catalog filter entry, a kind drop-down (all /
- * ETFs / mutual funds) and a category drop-down; a symbol search entry; an
+ * ETFs / mutual funds / indices) and a category drop-down; a symbol search entry; an
  * inline status line; the search results list (only visible while there are
  * results); the catalog list.
  *
@@ -35,7 +35,7 @@
  *    result shows "No results".
  *  - Every row shows a check button (checked == the symbol is in the
  *    watchlist), the symbol, the name, the category (catalog rows only) and
- *    a kind label ("Stock", "ETF" or "Fund"; for search results the kind the
+ *    a kind label ("Stock", "ETF", "Fund" or "Index"; for search results the kind the
  *    provider reported). Toggling the check button, or activating the row
  *    (Enter / double click), adds the instrument with that kind and its name
  *    (made valid UTF-8 and cut to STK_WATCHLIST_MAX_NAME_BYTES), or removes

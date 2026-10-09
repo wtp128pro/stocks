@@ -4,6 +4,10 @@
  * accepted only towards loopback hosts, for tests); no credentials, API keys
  * or cookies.
  *
+ * Serves STK_KIND_STOCK, STK_KIND_ETF and STK_KIND_FUND only: STK_KIND_INDEX
+ * is rejected with STK_ERROR_INVALID_ARG and no network traffic (indices come
+ * from StkYahoo; StkRouter sends each symbol to the right provider).
+ *
  * Endpoints used (SYM is percent-encoded; ASSET comes only from the StkKind:
  * stocks / etf / mutualfunds):
  *   quote        /api/quote/SYM/info?assetclass=ASSET

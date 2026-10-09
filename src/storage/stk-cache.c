@@ -204,7 +204,7 @@ currency_is_valid(const char *c)
 static gboolean
 quote_is_storable(const StkQuote *q)
 {
-  return q->symbol != NULL && stk_symbol_is_valid(q->symbol) && (guint)q->kind <= (guint)STK_KIND_FUND &&
+  return q->symbol != NULL && stk_symbol_is_valid(q->symbol) && (guint)q->kind <= (guint)STK_KIND_INDEX &&
          name_is_valid(q->name) && currency_is_valid(q->currency) && !isinf(q->price) &&
          !isinf(q->change) && !isinf(q->change_pct) && q->as_of_ms >= 0;
 }

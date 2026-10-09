@@ -36,7 +36,7 @@ ui_resources_lib = static_library(
   dependencies: gio_dep,
 )
 
-ui_deps = [core_dep, provider_dep, storage_dep, catalog_dep, chart_dep, picker_dep, scheduler_dep, gtk_dep]
+ui_deps = [core_dep, provider_dep, indices_dep, storage_dep, catalog_dep, chart_dep, picker_dep, scheduler_dep, gtk_dep]
 
 ui_lib = static_library(
   'stk-ui',

@@ -12,6 +12,7 @@ static const char *const kind_tokens[] = {
   [STK_KIND_STOCK] = "stock",
   [STK_KIND_ETF] = "etf",
   [STK_KIND_FUND] = "fund",
+  [STK_KIND_INDEX] = "index",
 };
 
 static const char *const range_tokens[] = {

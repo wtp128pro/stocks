@@ -1,6 +1,7 @@
 # Stocks
 
-A small GTK4 desktop watchlist for stocks, ETFs and Fidelity mutual funds,
+A small GTK4 desktop watchlist for stocks, ETFs, Fidelity mutual funds and
+the main US market indices,
 written in C with Meson. It shows a list of the instruments you follow (price,
 change, a one-month sparkline) and, for the selected one, a price chart for
 1D / 1M / 3M / 6M / 1Y. It is built to idle cheaply: no periodic timer runs
@@ -12,12 +13,14 @@ project.
 
 ## Features
 
-- Watchlist of stocks, ETFs and mutual funds, with per-row menu (Move up,
+- Watchlist of stocks, ETFs, mutual funds and the market indices (S&P 500,
+  Dow Jones, Nasdaq Composite, Russell 2000), with per-row menu (Move up,
   Move down, Remove) and drag-and-drop reordering. Stored locally.
 - Quote and 1M sparkline per row; chart of the selected row for 1D, 1M, 3M,
   6M and 1Y.
-- "Add" window: browse the built-in Fidelity ETF / mutual-fund catalog (filter
-  by text, kind and category) or search symbols online.
+- "Add" window: browse the built-in Fidelity ETF / mutual-fund catalog and the
+  four market indices (filter by text, kind - all, ETFs, mutual funds, indices -
+  and category) or search symbols online.
 - Cache: the latest quote and series of every symbol are kept on disk, so the
   first window paints from the cache without waiting for the network, and
   the app still shows data when offline. A failed refresh keeps the cached
@@ -26,7 +29,7 @@ project.
 
 ## Data source (read this)
 
-All market data comes from the **unofficial Nasdaq web API**
+Market data for stocks, ETFs and mutual funds comes from the **unofficial Nasdaq web API**
 (`https://api.nasdaq.com`): read-only HTTPS GETs, no account and no API key.
 This is not a documented or supported public API. It is meant for personal,
 low-volume use only; check Nasdaq's terms before using it for anything else.
@@ -36,11 +39,36 @@ the window usable). Quotes are not guaranteed to be real-time. The detail pane
 shows the date the quote refers to (New York calendar date, "As of Oct 08,
 2026", or "NAV · Oct 08, 2026" for funds); the list rows show no such text.
 
+The four **market indices** (S&P 500 `^GSPC`, Dow Jones `^DJI`, Nasdaq
+Composite `^IXIC`, Russell 2000 `^RUT`) are the one exception: Nasdaq's API does
+not serve them, so they come from a **second unofficial source**, the Yahoo
+Finance chart endpoint (`https://query1.finance.yahoo.com/v8/finance/chart/<symbol>`),
+used ONLY for those four symbols: read-only HTTPS GETs, no account, no API
+key, no cookies, sent with the app's identifying User-Agent
+`stocks-app/0.1 (personal use)`. Like the Nasdaq API it is not a
+documented or supported public API and using it sits in a terms-of-service
+gray area; it is meant for personal, low-volume use only, and you should
+check Yahoo's terms before using it for anything else. To stay polite the Yahoo
+provider makes at most one request at a time and starts requests at least 3 s
+apart, and the app fetches the indices one at a time, using at most one of its
+4 request slots (see "Refresh policy"), so the other symbols are never held
+back by them; a full refresh of the indices takes at least about 3 s per
+index job. Yahoo may throttle (HTTP 429, not retried) or break this
+endpoint at any time, or be slow or unreachable; then only the index rows go
+stale (cached data is kept) while the Nasdaq-backed symbols refresh on their
+normal schedule. Index quotes are not guaranteed to be
+real-time, and the symbol search in the Add window only searches Nasdaq (the
+indices are found in the catalog, filter "Indices").
+
 All network access goes through one interface, `StkProvider`
 (`src/provider/stk-provider.h`); the Nasdaq implementation is `StkNasdaq`
 (`src/provider/stk-nasdaq.h`, which lists the exact endpoints, timeouts and
-retry policy). A different data source means writing another implementation
-of that interface; nothing else in the app talks to the network.
+retry policy) for stocks, ETFs and funds, and `StkYahoo`
+(`src/indices/stk-yahoo.h`) for the market indices; `StkRouter`
+(`src/indices/stk-router.h`) sends symbols starting with `^` to Yahoo and every
+other symbol (and every search) to Nasdaq. A different data source means
+writing another implementation of that interface; nothing else in the app
+talks to the network.
 
 ## Build, run, test
 
@@ -54,7 +82,7 @@ compiler. The tools and tests below need `python3`; the GUI tests and
 meson setup build              # configure (debugoptimized, warning_level=3)
 meson compile -C build         # builds build/src/ui/stocks
 build/src/ui/stocks            # run
-GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test -C build   # 8 test suites; the GUI tests need a display
+GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test -C build   # 9 test suites; the GUI tests need a display
 ```
 
 Run the test gate as `GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test
@@ -86,11 +114,24 @@ The decisions live in `src/ui/stk-scheduler.h` (pure logic, unit-tested in
   clears the deadline without a final round.
 - The only other timers are one-shot: the save debounce (3 s after the first
   change) and the Add window's search debounce (300 ms), plus the provider's
-  per-request deadlines (10 s per attempt).
+  per-request deadlines (10 s per attempt) and, for the market indices, the
+  Yahoo provider's pacing timer (a request waits until at least 3 s have
+  passed since the previous Yahoo request started; it exists only while such
+  a request is queued).
 - Hiding the window or losing the network cancels requests in flight.
+- At most 4 requests are outstanding at once. Index symbols are fetched one at
+  a time and use at most one of those 4 slots: while an index request is
+  outstanding (even a slow or hanging one), the other index jobs wait and the
+  slots stay free for the Nasdaq-backed symbols. A slow or unreachable Yahoo
+  therefore leaves only the index rows stale; the Nasdaq-backed symbols
+  refresh on their normal schedule. A full refresh of the indices takes at
+  least about 3 s per index job (the Yahoo provider starts requests at least
+  3 s apart).
 - A failed request keeps the cached data, marks the symbol stale, and is retried
-  by the next refresh that includes it. The provider itself retries network
-  errors, timeouts and HTTP 5xx twice with back-off (1 s, 2 s).
+  by the next refresh that includes it. The Nasdaq provider itself retries
+  network errors, timeouts and HTTP 5xx twice with back-off (1 s, 2 s); the
+  Yahoo provider (market indices) retries the same errors at most twice, never
+  429 or other 4xx (see "Data source").
 - Pre-market, the 1D chart of a stock or ETF keeps showing the last trading
   session until today's regular session has points: Nasdaq returns only
   pre-market points before 09:30 ET and the provider keeps the regular session
@@ -105,6 +146,11 @@ button is hidden for a selected fund, only 1M..1Y charts are shown, and the
 quote is labelled "NAV".
 
 ## Fidelity catalog
+
+The four market indices come from the separate `data/market_indices.json`
+(kind `index`, category "Market indices"; also a GResource, merged with the
+Fidelity catalog at load and shown by the "Indices" kind filter of the Add
+window); the generator below does not touch it.
 
 `data/fidelity_catalog.json` (390 entries: 84 ETFs, 306 mutual funds,
 generated 2026-10-08) is compiled into the binary as a GResource; the app
@@ -159,6 +205,13 @@ and 250 000 series points (least recently used evicted) and a file larger than
 16 MiB is refused. A `*.stk-tmp-XXXXXX` file next to them is residue of an
 interrupted write and is removed at the next start once it is a minute old.
 The app writes no other files. Delete the files to reset it.
+
+Entries of kind `"index"` (the market indices) are stored in both files with
+the same `"version": 1`. An OLDER build of the app does not know that kind: it
+drops the `index` entries when it loads `watchlist.json` and writes the file
+back without them on the next edit of the watchlist, so downgrading removes
+the indices from your list. From `cache.json` it drops only the index quotes;
+the chart series of the indices stay in the file.
 
 ## Performance
 

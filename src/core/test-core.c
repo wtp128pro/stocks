@@ -25,7 +25,7 @@ test_error_domain(void)
 static void
 test_enum_strings(void)
 {
-  for (int k = STK_KIND_STOCK; k <= STK_KIND_FUND; k++) {
+  for (int k = STK_KIND_STOCK; k <= STK_KIND_INDEX; k++) {
     StkKind back = STK_KIND_STOCK;
     g_assert_true(stk_kind_from_string(stk_kind_to_string((StkKind)k), &back));
     g_assert_cmpint(back, ==, k);
@@ -36,6 +36,8 @@ test_enum_strings(void)
     g_assert_cmpint(back, ==, r);
   }
   g_assert_cmpstr(stk_kind_to_string(STK_KIND_FUND), ==, "fund");
+  g_assert_cmpstr(stk_kind_to_string(STK_KIND_INDEX), ==, "index");
+  g_assert_cmpint(STK_KIND_INDEX, ==, 3); /* appended last, never renumbered */
   g_assert_cmpstr(stk_range_to_string(STK_RANGE_1Y), ==, "1Y");
 
   StkKind kind = STK_KIND_ETF;
@@ -43,6 +45,11 @@ test_enum_strings(void)
   g_assert_false(stk_kind_from_string("", &kind));
   g_assert_false(stk_kind_from_string("ETF", &kind)); /* case-sensitive */
   g_assert_cmpint(kind, ==, STK_KIND_ETF);            /* untouched on failure */
+  g_assert_false(stk_kind_from_string("bond", &kind));
+  g_assert_false(stk_kind_from_string("INDEX", &kind));
+  g_assert_cmpint(kind, ==, STK_KIND_ETF);
+  g_assert_true(stk_kind_from_string("index", &kind));
+  g_assert_cmpint(kind, ==, STK_KIND_INDEX);
 
   StkRange range = STK_RANGE_3M;
   g_assert_false(stk_range_from_string(NULL, &range));
@@ -133,6 +140,13 @@ test_quote(void)
   g_autoptr(StkQuote) named = stk_quote_new("AAPL", "Apple Inc.", STK_KIND_STOCK, "EUR");
   g_assert_cmpstr(named->name, ==, "Apple Inc.");
   g_assert_cmpstr(named->currency, ==, "EUR");
+
+  g_autoptr(StkQuote) index_q = stk_quote_new("^gspc", "S&P 500", STK_KIND_INDEX, NULL);
+  g_assert_nonnull(index_q);
+  g_assert_cmpstr(index_q->symbol, ==, "^GSPC");
+  g_assert_cmpint(index_q->kind, ==, STK_KIND_INDEX);
+  g_autoptr(StkQuote) index_copy = stk_quote_copy(index_q);
+  g_assert_cmpint(index_copy->kind, ==, STK_KIND_INDEX);
 
   g_autoptr(StkQuote) lower = stk_quote_new("fbnd.x", NULL, STK_KIND_ETF, NULL);
   g_assert_cmpstr(lower->symbol, ==, "FBND.X");

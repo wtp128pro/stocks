@@ -5,10 +5,12 @@
 
 #include "stk-cache.h"
 #include "stk-nasdaq.h"
+#include "stk-router.h"
 #include "stk-row.h"
 #include "stk-scheduler.h"
 #include "stk-ui-resources.h"
 #include "stk-window.h"
+#include "stk-yahoo.h"
 
 #define CSS_RESOURCE_PATH "/org/stocks/ui/style.css"
 
@@ -871,7 +873,9 @@ stk_app_class_init(StkAppClass *klass)
 static void
 stk_app_init(StkApp *self)
 {
-  self->provider = STK_PROVIDER(stk_nasdaq_new());
+  g_autoptr(StkNasdaq) nasdaq = stk_nasdaq_new();
+  g_autoptr(StkYahoo) yahoo = stk_yahoo_new();
+  self->provider = STK_PROVIDER(stk_router_new(STK_PROVIDER(nasdaq), STK_PROVIDER(yahoo)));
   self->watchlist = stk_watchlist_new(NULL);
   self->cache = stk_cache_new(NULL);
   self->items = g_list_store_new(STK_TYPE_ROW_ITEM);

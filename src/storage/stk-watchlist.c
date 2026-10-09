@@ -131,7 +131,7 @@ stk_watchlist_contains(StkWatchlist *self, const char *symbol)
 static gboolean
 kind_is_valid(StkKind kind)
 {
-  return (guint)kind <= (guint)STK_KIND_FUND;
+  return (guint)kind <= (guint)STK_KIND_INDEX;
 }
 
 static gboolean

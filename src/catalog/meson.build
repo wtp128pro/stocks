@@ -3,8 +3,9 @@ gnome = import('gnome')
 json_glib_dep = dependency('json-glib-1.0', version: '>= 1.10.0')
 gio_dep = dependency('gio-2.0', version: '>= 2.68')
 
-# data/fidelity_catalog.json is compiled into the binary; the app never reads
-# it from disk or the network. source_dir lets the XML reference ../../data.
+# data/fidelity_catalog.json and data/market_indices.json are compiled into the
+# binary; the app never reads them from disk or the network. source_dir lets
+# the XML reference ../../data.
 catalog_resources = gnome.compile_resources(
   'stk-catalog-resources',
   'catalog.gresource.xml',

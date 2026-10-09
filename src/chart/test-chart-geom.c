@@ -41,6 +41,34 @@ test_is_up(void)
 }
 
 static void
+test_is_up_vs_close(void)
+{
+  double fade[3] = { 105.0, 99.0, 102.0 };   /* gap up, fade: first > last > prev */
+  double recover[3] = { 95.0, 101.0, 98.0 }; /* gap down, recover: first < last < prev */
+  double down[3] = { 3.0, 2.0, 1.0 };
+  double up[3] = { 1.0, 2.0, 3.0 };
+  g_assert_true(stk_chart_geom_is_up_vs_close(fade, 3, 100.0));
+  g_assert_false(stk_chart_geom_is_up(fade, 3));
+  g_assert_false(stk_chart_geom_is_up_vs_close(recover, 3, 100.0));
+  g_assert_true(stk_chart_geom_is_up(recover, 3));
+  double eq[2] = { 120.0, 100.0 };
+  g_assert_true(stk_chart_geom_is_up_vs_close(eq, 2, 100.0)); /* last == prev */
+  double nonfinite[3] = { NAN, INFINITY, -INFINITY };
+  for (int i = 0; i < 3; i++) {
+    g_assert_true(stk_chart_geom_is_up_vs_close(up, 3, nonfinite[i]) == stk_chart_geom_is_up(up, 3));
+    g_assert_true(stk_chart_geom_is_up_vs_close(down, 3, nonfinite[i]) == stk_chart_geom_is_up(down, 3));
+    g_assert_true(stk_chart_geom_is_up_vs_close(up, 3, nonfinite[i]));
+    g_assert_false(stk_chart_geom_is_up_vs_close(down, 3, nonfinite[i]));
+  }
+  g_assert_true(stk_chart_geom_is_up_vs_close(NULL, 0, 100.0));
+  g_assert_true(stk_chart_geom_is_up_vs_close(NULL, 0, NAN));
+  double one_hi[1] = { 101.0 };
+  double one_lo[1] = { 99.0 };
+  g_assert_true(stk_chart_geom_is_up_vs_close(one_hi, 1, 100.0));
+  g_assert_false(stk_chart_geom_is_up_vs_close(one_lo, 1, 100.0));
+}
+
+static void
 test_domain(void)
 {
   double t0 = -1, t1 = -1;
@@ -998,6 +1026,7 @@ main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, NULL);
   g_test_add_func("/chart-geom/is-up", test_is_up);
+  g_test_add_func("/chart-geom/is-up-vs-close", test_is_up_vs_close);
   g_test_add_func("/chart-geom/domain", test_domain);
   g_test_add_func("/chart-geom/ticks/nice-extreme", test_nice_ticks_extreme);
   g_test_add_func("/chart-geom/ticks/nice-fuzz", test_nice_ticks_fuzz);

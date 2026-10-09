@@ -539,6 +539,7 @@ test_watchlist_basic(void)
   g_autofree char *longname = g_strnfill(STK_WATCHLIST_MAX_NAME_BYTES + 1, 'n');
   g_assert_false(stk_watchlist_add(wl, "MSFT", longname, STK_KIND_STOCK));
   g_assert_false(stk_watchlist_add(wl, "MSFT", "x", (StkKind)99));
+  g_assert_false(stk_watchlist_add(wl, "MSFT", "x", (StkKind)(STK_KIND_INDEX + 1)));
   g_autofree char *okname = g_strnfill(STK_WATCHLIST_MAX_NAME_BYTES, 'n');
   g_assert_true(stk_watchlist_add(wl, "MSFT", okname, STK_KIND_STOCK));
   g_assert_cmpuint(changed, ==, 5);
@@ -596,7 +597,7 @@ test_watchlist_roundtrip_unicode(Fixture *f, gconstpointer unused)
   g_autoptr(StkWatchlist) wl = stk_watchlist_new(path);
   const char *names[] = {"Zürich Straße 日本株 ETF 🚀", "quote \" backslash \\ tab \t nl \n", "Fidelity® Fund™", ""};
   const char *syms[] = {"^GSPC", "EURUSD=X", "fxaix", "BF-B"};
-  StkKind kinds[] = {STK_KIND_ETF, STK_KIND_STOCK, STK_KIND_FUND, STK_KIND_STOCK};
+  StkKind kinds[] = {STK_KIND_INDEX, STK_KIND_STOCK, STK_KIND_FUND, STK_KIND_STOCK};
   for (guint i = 0; i < 4; i++)
     g_assert_true(stk_watchlist_add(wl, syms[i], names[i], kinds[i]));
 
@@ -707,6 +708,7 @@ test_watchlist_load_partial(Fixture *f, gconstpointer unused)
            "\"just a string\","
            "null,"
            "{\"symbol\":\"FXAIX\",\"name\":\"Fidelity 500\",\"kind\":\"fund\"},"
+           "{\"symbol\":\"^DJI\",\"name\":\"Dow\",\"kind\":\"index\"},"
            "{\"symbol\":\"SPY\",\"name\":\"ünï\",\"kind\":\"etf\"}"
            "]}");
   g_autoptr(StkWatchlist) wl = stk_watchlist_new(path);
@@ -718,9 +720,10 @@ test_watchlist_load_partial(Fixture *f, gconstpointer unused)
   g_assert_no_error(err);
   g_assert_cmpuint(dropped, ==, 8);
   g_assert_cmpuint(changed, ==, 1);
-  const char *const want[] = {"AAPL", "FXAIX", "SPY", NULL};
+  const char *const want[] = {"AAPL", "FXAIX", "^DJI", "SPY", NULL};
   assert_symbols(wl, want);
   g_assert_cmpstr(stk_watchlist_get_entry(wl, 0)->name, ==, "Apple");
+  g_assert_cmpint(stk_watchlist_get_entry(wl, 2)->kind, ==, STK_KIND_INDEX);
 }
 
 static void
@@ -1259,6 +1262,9 @@ test_cache_roundtrip(Fixture *f, gconstpointer unused)
   gint64 fetched = now_ms() - 123456;
   g_autoptr(StkQuote) q = make_quote("AAPL", "Apple \"Inc\" \\ \n 日本 🚀 \x01", STK_KIND_STOCK);
   g_autoptr(StkQuote) qf = make_quote("FXAIX", "Fidelity 500 Index", STK_KIND_FUND);
+  g_autoptr(StkQuote) qi = make_quote("^DJI", "Dow Jones Industrial Average", STK_KIND_INDEX);
+  qi->price = 44123.45;
+  g_assert_cmpint(qi->kind, ==, STK_KIND_INDEX);
   qf->price = NAN; /* unknown values survive as NAN */
   qf->change = NAN;
   qf->change_pct = NAN;
@@ -1266,6 +1272,10 @@ test_cache_roundtrip(Fixture *f, gconstpointer unused)
   qf->market_open = FALSE;
   g_assert_true(stk_cache_put_quote(c, q, fetched));
   g_assert_true(stk_cache_put_quote(c, qf, fetched));
+  g_assert_true(stk_cache_put_quote(c, qi, fetched));
+  q->kind = (StkKind)(STK_KIND_INDEX + 1); /* out of range: never stored */
+  g_assert_false(stk_cache_put_quote(c, q, fetched));
+  q->kind = STK_KIND_STOCK;
 
   g_autoptr(StkSeries) s1d = make_series(STK_RANGE_1D, 400, 186.25, 1);
   g_autoptr(StkSeries) s1m = make_series(STK_RANGE_1M, 22, NAN, 2);
@@ -1299,7 +1309,7 @@ test_cache_roundtrip(Fixture *f, gconstpointer unused)
   g_assert_true(stk_cache_load(c2, &err));
   g_assert_no_error(err);
   g_assert_false(stk_cache_is_dirty(c2));
-  g_assert_cmpuint(stk_cache_get_n_symbols(c2), ==, 3);
+  g_assert_cmpuint(stk_cache_get_n_symbols(c2), ==, 4);
 
   gint64 age = 0;
   g_autoptr(StkQuote) lq = stk_cache_get_quote(c2, "AAPL", &age);
@@ -1310,6 +1320,10 @@ test_cache_roundtrip(Fixture *f, gconstpointer unused)
   g_autoptr(StkQuote) lqf = stk_cache_get_quote(c2, "FXAIX", NULL);
   g_assert_nonnull(lqf);
   assert_quote_equal(qf, lqf);
+  g_autoptr(StkQuote) lqi = stk_cache_get_quote(c2, "^DJI", NULL);
+  g_assert_nonnull(lqi);
+  g_assert_cmpint(lqi->kind, ==, STK_KIND_INDEX);
+  assert_quote_equal(qi, lqi);
   g_assert_null(stk_cache_get_quote(c2, "^GSPC", NULL));
 
   g_autoptr(StkSeries) l1d = stk_cache_get_series(c2, "AAPL", STK_RANGE_1D, &age);
@@ -1446,6 +1460,9 @@ test_cache_load_partial(Fixture *f, gconstpointer unused)
   const char *good_q =
     "{\"fetched_at_ms\":1000,\"name\":\"Good\",\"kind\":\"etf\",\"price\":1.5,\"change\":null,"
     "\"change_pct\":2,\"as_of_ms\":5,\"is_realtime\":false,\"market_open\":true,\"currency\":\"USD\"}";
+  const char *good_idx_q =
+    "{\"fetched_at_ms\":1000,\"name\":\"Idx\",\"kind\":\"index\",\"price\":5000.5,\"change\":1,"
+    "\"change_pct\":0.5,\"as_of_ms\":5,\"is_realtime\":false,\"market_open\":true,\"currency\":\"USD\"}";
   g_autofree char *doc = g_strdup_printf(
     "{\"version\":1,\"entries\":["
     "{\"symbol\":\"../evil\",\"quote\":%s},"                                   /* bad symbol */
@@ -1462,16 +1479,17 @@ test_cache_load_partial(Fixture *f, gconstpointer unused)
     "\"change\":1,\"change_pct\":1,\"as_of_ms\":1,\"is_realtime\":true,\"market_open\":true,\"currency\":\"USD\"}},"
     "{\"symbol\":\"EMPTY\"},"
     "{\"symbol\":\"OKQ\",\"quote\":%s,\"series\":[1,2]},"                      /* series wrong type: quote kept */
+    "{\"symbol\":\"^IDX\",\"quote\":%s},"                                      /* index kind is valid */
     "[1,2,3],\"str\",null"
     "]}",
-    good_q, good_q, good_q, good_q, good_q);
+    good_q, good_q, good_q, good_q, good_q, good_idx_q);
   put_text(path, doc);
 
   g_autoptr(StkCache) c = stk_cache_new(path);
   GError *err = NULL;
   g_assert_true(stk_cache_load(c, &err));
   g_assert_no_error(err);
-  g_assert_cmpuint(stk_cache_get_n_symbols(c), ==, 2);
+  g_assert_cmpuint(stk_cache_get_n_symbols(c), ==, 3);
 
   g_autoptr(StkQuote) q = stk_cache_get_quote(c, "GOOD", NULL);
   g_assert_nonnull(q);
@@ -1488,6 +1506,9 @@ test_cache_load_partial(Fixture *f, gconstpointer unused)
   for (int r = STK_RANGE_1M; r <= STK_RANGE_1Y; r++)
     g_assert_null(stk_cache_get_series(c, "GOOD", (StkRange)r, NULL));
   g_assert_true(has_quote(c, "OKQ"));
+  g_autoptr(StkQuote) iq = stk_cache_get_quote(c, "^IDX", NULL);
+  g_assert_nonnull(iq);
+  g_assert_cmpint(iq->kind, ==, STK_KIND_INDEX);
   g_assert_false(has_quote(c, "BADKIND"));
 }
 

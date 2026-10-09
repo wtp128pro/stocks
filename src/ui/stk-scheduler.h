@@ -68,6 +68,19 @@
  *    request. A cancelled request keeps its slot until its completion is
  *    reported with stk_scheduler_request_done(), so a replacement request of
  *    the same symbol never overlaps it.
+ *  - Index requests: at most STK_SCHED_MAX_INFLIGHT_INDEX request issued
+ *    with kind STK_KIND_INDEX is outstanding at any moment, and it counts
+ *    toward STK_SCHED_MAX_INFLIGHT. The kind is the one the request was
+ *    issued with, so changing a symbol's kind (stk_scheduler_set_symbols())
+ *    while it is in flight does not allow a second one. Outstanding means
+ *    not yet reported finished by stk_scheduler_request_done(): a cancelled
+ *    request and the request of a removed symbol still count. While one is
+ *    outstanding, the waiting jobs of INDEX symbols are skipped (they stay
+ *    wanted, are not failed or dropped) and the waiting jobs of every other
+ *    symbol start as usual, so a slow index source can hold only one slot;
+ *    the skipped jobs start, in the usual priority order, when it is
+ *    reported finished. The rule looks only at the kind: no clock, timer or
+ *    pacing.
  *  - Failure: a FAILED completion marks the symbol stale
  *    (stk_scheduler_is_stale()) until a request of the same job succeeds or,
  *    for the DETAIL job, the selection changes; the owner keeps showing its
@@ -115,6 +128,9 @@ G_BEGIN_DECLS
 #define STK_SCHED_PERIOD_US (60 * G_USEC_PER_SEC)
 /** Maximum number of requests outstanding at once (all symbols). */
 #define STK_SCHED_MAX_INFLIGHT 4
+/** Maximum number of outstanding requests issued with kind STK_KIND_INDEX (they count toward
+ *  STK_SCHED_MAX_INFLIGHT). */
+#define STK_SCHED_MAX_INFLIGHT_INDEX 1
 /** A job whose latest request succeeded less than this ago is skipped by rounds. */
 #define STK_SCHED_MIN_EVENT_GAP_US (5 * G_USEC_PER_SEC)
 /** Wall-minus-monotonic drift above which a forward clock jump is assumed. */

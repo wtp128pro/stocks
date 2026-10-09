@@ -2,5 +2,6 @@
 <gresources>
   <gresource prefix="/org/stocks/catalog">
     <file alias="fidelity_catalog.json">../../data/fidelity_catalog.json</file>
+    <file alias="market_indices.json">../../data/market_indices.json</file>
   </gresource>
 </gresources>
