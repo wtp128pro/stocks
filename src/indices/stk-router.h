@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-router.h - StkRouter: a StkProvider that sends index symbols to one
  * provider (StkYahoo in the app) and everything else to another (StkNasdaq).

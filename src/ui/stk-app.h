@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-app.h - StkApp: the GtkApplication of the stocks app and the owner of
  * its data: the StkProvider (network), the StkWatchlist and StkCache
@@ -82,7 +84,7 @@
 
 G_BEGIN_DECLS
 
-#define STK_APP_ID "org.stocks.Stocks"
+#define STK_APP_ID "io.github.wtp128pro.Stocks"
 /** Changes are written at most this long after the first unsaved change. */
 #define STK_APP_SAVE_DELAY_MS 3000
 /** Upper bound of the wait for pending saves and cancelled requests at exit. */

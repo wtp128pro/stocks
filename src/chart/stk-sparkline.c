@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-sparkline.c - StkSparkline: tiny fixed-size trend line for list rows.
  * See stk-sparkline.h for the public contract.

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-scheduler.h - StkScheduler: pure refresh-policy logic of the stocks app.
  *

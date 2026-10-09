@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-nasdaq.c - StkProvider implementation for the Nasdaq web API.
  * See stk-nasdaq.h for the behaviour contract.

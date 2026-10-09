@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-watchlist.h - the user's ordered list of tracked instruments, persisted
  * as JSON.

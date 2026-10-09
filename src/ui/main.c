@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* main.c - entry point of the stocks desktop app. */
 #include <glib-unix.h>
 #include <glib.h>
@@ -19,6 +21,7 @@ main(int argc, char **argv)
 {
   g_set_prgname("stocks");
   g_set_application_name("Stocks");
+  gtk_window_set_default_icon_name(STK_APP_ID);
 
   g_autoptr(StkApp) app = stk_app_new();
   g_unix_signal_add(SIGINT, on_terminate, app);

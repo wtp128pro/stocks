@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-window.c - StkWindow: watchlist list view, detail pane, picker launcher. */
 #include "stk-window.h"
 

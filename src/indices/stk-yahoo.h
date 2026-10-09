@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-yahoo.h - StkYahoo: StkProvider for MARKET INDICES (^GSPC, ^DJI, ^IXIC,
  * ^RUT) backed by the unofficial, keyless Yahoo Finance chart endpoint.

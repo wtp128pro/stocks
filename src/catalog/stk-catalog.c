@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-catalog.c - see stk-catalog.h. */
 #include "stk-catalog.h"
 
@@ -7,8 +9,8 @@
 
 #include "stk-catalog-resources.h"
 
-#define CATALOG_RESOURCE_FIDELITY "/org/stocks/catalog/fidelity_catalog.json"
-#define CATALOG_RESOURCE_INDICES "/org/stocks/catalog/market_indices.json"
+#define CATALOG_RESOURCE_FIDELITY "/io/github/wtp128pro/Stocks/catalog/fidelity_catalog.json"
+#define CATALOG_RESOURCE_INDICES "/io/github/wtp128pro/Stocks/catalog/market_indices.json"
 #define CATALOG_VERSION 1
 /* STK symbols are at most 15 bytes (stk_symbol_is_valid). */
 #define SYMBOL_BUF 16

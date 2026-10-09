@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* Offline unit tests for the catalog module (loader + shipped data). */
 #include <glib.h>
 #include <string.h>

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-yahoo.c - StkProvider implementation for the Yahoo Finance chart
  * endpoint (market indices only). See stk-yahoo.h for the behaviour contract.

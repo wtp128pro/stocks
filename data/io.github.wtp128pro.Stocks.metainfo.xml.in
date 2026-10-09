@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.wtp128pro.Stocks</id>
+  <name>Stocks</name>
+  <summary>Watchlist for stocks, ETFs, mutual funds and market indices</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.wtp128pro">
+    <name>wtp128pro</name>
+  </developer>
+  <description>
+    <p>
+      Stocks is a small GTK4 desktop watchlist. It lists the instruments you
+      follow with price, change and a one-month sparkline, and shows a price
+      chart for the selected one (1D, 1M, 3M, 6M and 1Y). It includes a
+      built-in catalog of Fidelity ETFs and mutual funds and the main US
+      market indices, and keeps a local cache so it still shows data when
+      offline.
+    </p>
+    <p>
+      Quotes come from unofficial, keyless web endpoints: Nasdaq for stocks,
+      ETFs and mutual funds, and Yahoo Finance for the four market indices.
+      These are not documented or supported public APIs; they are meant for
+      personal, low-volume use only and may change, throttle requests or stop
+      working at any time. Quotes are not guaranteed to be real-time.
+    </p>
+    <p>
+      Stocks does not trade, log in to a broker or sync a Fidelity account. It is not
+      affiliated with, endorsed by or sponsored by Fidelity, Nasdaq, Yahoo or
+      Apple; all names belong to their owners.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.wtp128pro.Stocks.desktop</launchable>
+  <provides>
+    <binary>stocks</binary>
+  </provides>
+  <url type="homepage">https://github.com/wtp128pro/stocks</url>
+  <url type="bugtracker">https://github.com/wtp128pro/stocks/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-09">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

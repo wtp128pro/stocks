@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-chart-geom.c - pure chart geometry and label formatting (no GTK).
  * See stk-chart-geom.h for the contracts.

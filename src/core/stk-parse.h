@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-parse.h - strict parsers for the formatted number strings that quote
  * providers return ("$340.52", "+0.24", "-0.04%", "1,234", "N/A").

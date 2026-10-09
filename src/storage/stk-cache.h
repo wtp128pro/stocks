@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-cache.h - bounded on-disk cache of the latest StkQuote and StkSeries per
  * symbol, used to show stale data instantly and when offline.

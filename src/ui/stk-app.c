@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-app.c - StkApp: data ownership, refresh execution, persistence. */
 #include "stk-app.h"
 
@@ -12,7 +14,7 @@
 #include "stk-window.h"
 #include "stk-yahoo.h"
 
-#define CSS_RESOURCE_PATH "/org/stocks/ui/style.css"
+#define CSS_RESOURCE_PATH "/io/github/wtp128pro/Stocks/ui/style.css"
 
 typedef struct {
   GWeakRef app; /* weak: a pending request must never keep the application alive */

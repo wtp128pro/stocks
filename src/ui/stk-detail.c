@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-detail.c - StkDetail: price, change, range switcher and chart. */
 #include "stk-detail.h"
 

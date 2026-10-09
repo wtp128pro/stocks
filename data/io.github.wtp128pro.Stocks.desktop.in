@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Stocks
+GenericName=Stock Watchlist
+Comment=Watch stock, ETF, mutual fund and market index quotes
+Exec=stocks
+Icon=io.github.wtp128pro.Stocks
+Terminal=false
+Categories=Office;Finance;GTK;
+Keywords=stocks;etf;funds;finance;watchlist;market;quotes;
+StartupWMClass=stocks
+StartupNotify=true

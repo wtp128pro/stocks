@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-row.h - the watchlist's per-instrument model (StkRowItem), the list row
  * widget that shows it (StkRow) and the number/text formatting shared with

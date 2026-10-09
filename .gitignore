@@ -25,3 +25,13 @@ compile_commands.json
 *~
 core.[0-9]*
 vgcore.*
+
+# Release / packaging artefacts (never committed)
+/buildDir/
+/rpmbuild/
+*.rpm
+*.src.rpm
+*.tar.gz
+
+# Orchestration work directory
+.omp_wip/

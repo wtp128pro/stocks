@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-nasdaq.h - StkNasdaq: StkProvider backed by the unofficial Nasdaq web
  * API (https://api.nasdaq.com). Read-only GETs over HTTPS (plain HTTP is

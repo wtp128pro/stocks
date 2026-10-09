@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-picker.c - StkPicker implementation. Behaviour is specified in
  * stk-picker.h.

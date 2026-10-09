@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * stk-picker.h - StkPicker: window to browse the Fidelity catalog, search
  * symbols online and add/remove instruments of the watchlist.

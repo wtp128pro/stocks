@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* Offline tests for the storage module: fileio, watchlist and cache. */
 #define _XOPEN_SOURCE 700 /* mkfifo(), truncate(), fchmod() under -std=c11 */
 

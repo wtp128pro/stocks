@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
-  <gresource prefix="/org/stocks/catalog">
+  <gresource prefix="/io/github/wtp128pro/Stocks/catalog">
     <file alias="fidelity_catalog.json">../../data/fidelity_catalog.json</file>
     <file alias="market_indices.json">../../data/market_indices.json</file>
   </gresource>

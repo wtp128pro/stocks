@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-scheduler.c - see stk-scheduler.h for the rules. Pure logic. */
 #include "stk-scheduler.h"
 

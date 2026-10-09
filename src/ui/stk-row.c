@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-row.c - StkRowItem model, StkRow widget and shared formatting. */
 #include "stk-row.h"
 

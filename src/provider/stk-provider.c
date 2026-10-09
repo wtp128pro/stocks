@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* stk-provider.c - StkProvider interface dispatch. See stk-provider.h. */
 #include "stk-provider.h"
 

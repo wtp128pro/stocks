@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 #define _XOPEN_SOURCE 700 /* fsync(), O_DIRECTORY, O_CLOEXEC under -std=c11 */
 
 #include "stk-fileio.h"

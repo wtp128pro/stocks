@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /* test-chart-geom.c - unit tests for the pure chart geometry (no GTK). */
 #include <float.h>
 #include <locale.h>

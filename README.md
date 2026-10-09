@@ -25,7 +25,7 @@ project.
   first window paints from the cache without waiting for the network, and
   the app still shows data when offline. A failed refresh keeps the cached
   data and dims it (stale marker; the detail pane says "Stale" or "Offline").
-- Application id `org.stocks.Stocks`.
+- Application id `io.github.wtp128pro.Stocks`.
 
 ## Data source (read this)
 
@@ -70,19 +70,71 @@ other symbol (and every search) to Nasdaq. A different data source means
 writing another implementation of that interface; nothing else in the app
 talks to the network.
 
-## Build, run, test
+## Install
+
+### From the RPM (Fedora)
+
+Download `stocks-0.1.0-1.<dist>.<arch>.rpm` from the
+[GitHub releases](https://github.com/wtp128pro/stocks/releases) page and
+install it with
+
+```sh
+sudo dnf install ./stocks-0.1.0-1.*.rpm
+```
+
+It installs the `stocks` command, a desktop entry (Office / Finance), an
+AppStream metainfo file and a full-colour and a symbolic icon, and needs no
+runtime dependency beyond the libraries `dnf` resolves from the binary and
+`hicolor-icon-theme`. The source RPM (`stocks-0.1.0-1.*.src.rpm`) is on the
+same page; see "Packaging notes" below to build it yourself.
+
+### Build from source
 
 Dependencies (pkg-config names): `gtk4` >= 4.14, `libsoup-3.0`,
-`json-glib-1.0` >= 1.10.0, `glib-2.0` >= 2.68, plus Meson >= 1.0, Ninja and a C11
-compiler. The tools and tests below need `python3`; the GUI tests and
+`json-glib-1.0` >= 1.10.0, `glib-2.0` >= 2.68 (with `glib-compile-resources`),
+plus Meson >= 1.0, Ninja and a C11 compiler. On Fedora:
+
+```sh
+sudo dnf install gcc meson ninja-build gtk4-devel libsoup3-devel json-glib-devel glib2-devel
+# to run the whole test suite as well:
+sudo dnf install desktop-file-utils libappstream-glib appstream xorg-x11-server-Xvfb
+```
+
+The tools and tests below need `python3`; the GUI tests and
 `tools/perf_check.sh` need `Xvfb` (package `xorg-x11-server-Xvfb` on Fedora);
 `xvfb-run` is used by the test command below but not by the script.
 
 ```sh
 meson setup build              # configure (debugoptimized, warning_level=3)
 meson compile -C build         # builds build/src/ui/stocks
-build/src/ui/stocks            # run
-GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test -C build   # 9 test suites; the GUI tests need a display
+```
+
+If you already have a `build` directory from an older checkout, run
+`meson setup --reconfigure build` instead. Meson re-runs the configuration
+only when a `meson.build` it has already read changes, and `src/meson.build`
+includes a module directory only if it exists at configure time, so a build
+directory configured before a module directory appeared keeps ignoring it
+(its targets and tests are silently missing).
+
+To install, `meson install -C build` (default prefix `/usr/local`; choose
+another one with `meson setup --prefix=... build`). It installs the binary,
+the desktop entry, the metainfo file and the two icons under the prefix; it
+does not refresh icon or desktop-entry caches.
+
+### Run
+
+```sh
+build/src/ui/stocks            # from the build directory
+stocks                         # after installing
+```
+
+The application id is `io.github.wtp128pro.Stocks`; the installed desktop
+entry, metainfo file and icons carry that name.
+
+### Test
+
+```sh
+GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test -C build   # 13 tests in 9 suites; the GUI tests need a display
 ```
 
 Run the test gate as `GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a meson test
@@ -91,6 +143,20 @@ your real `ibus-daemon`, which makes typing bursts on your desktop. `meson
 test` without `xvfb-run` works only if a display is available; the test suites
 that open windows pin `GDK_BACKEND=x11`, so run them under `xvfb-run -a` to
 keep them off your real session. The picker suite takes about 20 s.
+
+The 13 tests are in the suites `core`, `provider`, `indices`, `storage`,
+`catalog`, `chart` (2 tests), `picker`, `ui` and `data` (4 tests). None needs
+the network. Only `chart-widget` and `picker` need a display (they exit 77,
+which Meson reports as skipped, when none can be opened). The `data` suite
+checks the packaging files: `app-id` (a shell script,
+`data/check-app-id.sh`, that compares the application id in
+`src/ui/stk-app.h` with the desktop entry, metainfo and icon names and the
+GResource paths, and rejects any leftover use of the retired id) always runs; the other
+three run `desktop-file-validate`, `appstreamcli validate --no-net` and
+`appstream-util validate-relax --nonet` on the desktop entry and the metainfo
+file, and are registered only when the tool is installed (packages
+`desktop-file-utils`, `appstream` and `libappstream-glib` on Fedora), so
+without them the suite has 1 test and the total is 10.
 
 ## Refresh policy
 
@@ -402,6 +468,12 @@ empty, negative) exits 2 immediately, before anything is started.
   app was not run for several days). Nasdaq returns only pre-market points
   before 09:30 ET and the provider keeps the regular session only, so the
   1D chart shows the last session until today's regular session has points.
+- **Sparkline colour.** The colour of a row's sparkline comes from its own
+  one-month series (positive when the last point is at or above the first,
+  negative otherwise), while the change figure in the row is coloured from the
+  quote's daily change. The two can therefore disagree: for example a stock
+  that is down on the day but up over the month shows a negative change next
+  to a positive sparkline.
 - Quotes depend on the unofficial API (see above); a failed refresh shows
   the previous data dimmed, not an error dialog. Fidelity funds'
   NAV arrives once a day.
@@ -426,3 +498,96 @@ empty, negative) exits 2 immediately, before anything is started.
   on a Wayland compositor in this project.
 - The unit tests of the scheduler cover only its pure logic; the glue in
   `StkApp` was checked by live smoke runs, not by repository tests.
+
+## Licence
+
+Stocks is free software, licensed under the GNU General Public License,
+version 3 or (at your option) any later version (`GPL-3.0-or-later`), the
+licence used by GNOME applications. The full text is in [`COPYING`](COPYING);
+every C source and header under `src/` starts with an SPDX identifier and a
+copyright line (`Copyright (C) 2026 wtp128pro`). The AppStream metainfo file
+is `CC0-1.0`, as AppStream recommends. The icons were drawn for this
+project and are covered by the same licence as the program.
+
+## Data provenance and trademarks
+
+- `data/fidelity_catalog.json` is a factual list of the symbols, names and
+  categories of funds and ETFs that Fidelity lists publicly. It is a snapshot
+  (`generated` 2026-10-08) built by `tools/build_catalog.py` from public
+  Fidelity web pages (`fidelity.com/etfs/find-an-etf` and an institutional
+  "average annual returns" page), cross-checked with the Nasdaq Trader symbol
+  directories (`nasdaqtrader.com`); the script's docstring lists the exact
+  sources and rules. It holds no prices and no other Fidelity content.
+  `data/market_indices.json` lists the four indices of "Data source".
+- Quotes and charts come from the **unofficial** Nasdaq web API and, for the
+  four indices, the **unofficial** Yahoo Finance chart endpoint, both
+  keyless (see "Data source (read this)"). They are not documented or
+  supported public APIs, are meant for personal, low-volume use only, may
+  change, throttle you or stop working at any time, and their terms of use
+  are yours to check.
+- Stocks is not affiliated with, endorsed by or sponsored by Fidelity,
+  Nasdaq, Yahoo or Apple. All company, fund, index and product names that
+  appear in the app, in the data files or in this repository (for example
+  Fidelity, Nasdaq, Yahoo, Apple, S&P 500, Dow Jones and Russell 2000)
+  belong to their respective owners and are used only to identify the
+  instruments.
+
+## Packaging notes (Fedora maintainers)
+
+The package is meant to be picked up by Fedora, and the repository carries
+what a reviewer needs:
+
+- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.1.0,
+  `License: GPL-3.0-or-later AND CC0-1.0`, `URL` https://github.com/wtp128pro/stocks).
+- Source: `Source0` is `%{url}/archive/v%{version}/%{name}-%{version}.tar.gz`,
+  i.e. GitHub's archive of the tag `v0.1.0`, named `stocks-0.1.0.tar.gz`, whose
+  top-level directory is `stocks-0.1.0/` (the spec uses `%autosetup`).
+- Build with Meson (`%meson`, `%meson_build`, `%meson_install`); no
+  patches, no bundled libraries, no Internet access at build or test time.
+  `BuildRequires` (all resolve with `rpm -q --whatprovides`): `gcc`, `meson`,
+  `glib2-devel` (`glib-compile-resources`), `pkgconfig(gtk4)` >= 4.14,
+  `pkgconfig(libsoup-3.0)`, `pkgconfig(json-glib-1.0)` >= 1.10.0,
+  `pkgconfig(glib-2.0)` and `pkgconfig(gio-2.0)` >= 2.68, and for `%check`
+  `desktop-file-utils`, `libappstream-glib`, `appstream` and
+  `xorg-x11-server-Xvfb`. `Requires: hicolor-icon-theme` (owner of the icon
+  directories); library requirements are generated from the binary.
+- `%files` lists exact paths: the binary, the desktop entry, the metainfo
+  file, the two icons, `%license COPYING` and `%doc README.md`.
+
+Build the source and binary RPMs from a checkout (the tarball must contain the
+tag's tree, so commit and tag first):
+
+```sh
+git archive --prefix=stocks-0.1.0/ -o stocks-0.1.0.tar.gz HEAD
+mkdir -p rpmbuild/SOURCES && mv stocks-0.1.0.tar.gz rpmbuild/SOURCES/
+rpmbuild -ba --define "_topdir $PWD/rpmbuild" packaging/rpm/stocks.spec
+rpmlint packaging/rpm/stocks.spec rpmbuild/RPMS/*/stocks-*.rpm rpmbuild/SRPMS/stocks-*.src.rpm
+```
+
+`rpmbuild/`, `*.rpm` and `*.tar.gz` are in `.gitignore`. `%check` runs, in
+this order, `desktop-file-validate` on the installed desktop entry,
+`appstream-util validate-relax --nonet` on the installed metainfo file, and
+`GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a %{shrink:%meson_test}` (`%shrink`
+because `%meson_test` expands with a leading line break), i.e. the whole
+test suite of the "Test" subsection (13 tests, the validators included). Two of the tests
+(`chart-widget` and `picker`) open GTK windows, which needs an X display and
+therefore `xorg-x11-server-Xvfb`; they skip themselves (exit 77) when none is
+available, so without Xvfb the build would silently test less.
+`GTK_IM_MODULE=simple` keeps the test processes from connecting to an
+input-method daemon.
+
+`xvfb-run` creates its X socket in `/tmp/.X11-unix` and a lock file
+`/tmp/.X<n>-lock`, the same places a desktop session on that machine uses. A
+plain mount namespace (`unshare -rm rpmbuild ...`) does **not** change that: it
+shares the host's `/tmp` until something is mounted over it. On a desktop
+machine, give the build a private `/tmp` instead:
+
+```sh
+unshare -rm sh -c 'mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $PWD/rpmbuild" packaging/rpm/stocks.spec'
+```
+
+This needs a checkout (and thus `rpmbuild/`) outside `/tmp`, and unprivileged
+user namespaces. The build needs only the loopback device (the `nasdaq` and
+`indices` tests talk to a fake server on it), so do not add `-n` without
+bringing `lo` up first (`ip link set lo up`). Mock and Koji build in their own
+chroot, where none of this is needed.

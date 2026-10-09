@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * NYSE calendar sources (rules are encoded below, not copied as tables):
  *  - NYSE "Holidays & Trading Hours": https://www.nyse.com/trade/hours-calendars

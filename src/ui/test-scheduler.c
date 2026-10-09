@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 wtp128pro */
 /*
  * test-scheduler.c - offline unit tests of StkScheduler (src/ui/stk-scheduler.h).
  *
