@@ -705,8 +705,12 @@ build_window(StkWindow *self, StkApp *app)
   gtk_window_set_default_size(GTK_WINDOW(self), 1040, 640);
 
   GtkWidget *header = gtk_header_bar_new();
-  GtkWidget *add = gtk_button_new_with_label("Add");
+  /* "list-add-symbolic" is a freedesktop standard name every icon theme provides or inherits
+   * (GTK also ships Adwaita's copy as a fallback); an icon-only button needs an explicit
+   * accessible label. */
+  GtkWidget *add = gtk_button_new_from_icon_name("list-add-symbolic");
   gtk_widget_set_tooltip_text(add, "Add a stock, ETF or fund");
+  gtk_accessible_update_property(GTK_ACCESSIBLE(add), GTK_ACCESSIBLE_PROPERTY_LABEL, "Add", -1);
   self->add_buttons[0] = add;
   g_signal_connect_object(add, "clicked", G_CALLBACK(on_add_clicked), self, G_CONNECT_SWAPPED);
   gtk_header_bar_pack_start(GTK_HEADER_BAR(header), add);
