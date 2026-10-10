@@ -10,6 +10,9 @@
 
 #define N_RANGES 5
 
+/* range_buttons[] and range_labels[] are indexed by StkRange. */
+G_STATIC_ASSERT(N_RANGES == STK_RANGE_1Y + 1);
+
 struct _StkDetail {
   GtkBox parent_instance;
   GtkWidget *stack;
@@ -32,6 +35,12 @@ struct _StkDetail {
   StkSeries *shown_series; /* strong: what the chart currently draws */
 };
 
+/*
+ * G_DEFINE_FINAL_TYPE() below defines stk_detail_get_type(), the static
+ * stk_detail_parent_class pointer and the static class initialiser that runs
+ * stk_detail_class_init() once; stk_detail_init() is registered as the
+ * instance initialiser. The instance struct is _StkDetail (StkDetail).
+ */
 G_DEFINE_FINAL_TYPE(StkDetail, stk_detail, GTK_TYPE_BOX)
 
 enum { SIGNAL_RANGE_CHANGED, N_SIGNALS };
@@ -43,6 +52,24 @@ static const char *const range_labels[N_RANGES] = {"1D", "1M", "3M", "6M", "1Y"}
 /* Rendering                                                                */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * format_caption:
+ * @q: (nullable): the quote, or NULL when there is none.
+ * @kind: the instrument class (funds get the "NAV" prefix).
+ *
+ * Builds the caption under the change: the New York date of the quote's timestamp.
+ *
+ * Preconditions:
+ *  - @q is NULL or a valid StkQuote.
+ * Postconditions:
+ *  - nothing is changed.
+ * Thread affinity: main thread only.
+ * Ownership: @q is borrowed for the call; the result is owned by the caller.
+ *
+ * Returns: (transfer full): "NAV · <date>" (funds) or "As of <date>" (others) when @q has a
+ *   positive timestamp whose New York date could be computed and formatted ("%b %d, %Y"); otherwise
+ *   "NAV" for funds and "" for the others. Never NULL.
+ */
 static char *
 format_caption(const StkQuote *q, StkKind kind)
 {
@@ -55,12 +82,29 @@ format_caption(const StkQuote *q, StkKind kind)
     if (dt != NULL) {
       g_autofree char *text = g_date_time_format(dt, "%b %d, %Y");
       if (text != NULL)
-        return g_strdup_printf(fund ? "NAV \xc2\xb7 %s" : "As of %s", text);
+        return fund ? g_strdup_printf("NAV \xc2\xb7 %s", text)
+                    : g_strdup_printf("As of %s", text);
     }
   }
   return g_strdup(fund ? "NAV" : "");
 }
 
+/**
+ * set_change_class:
+ * @self: (not nullable): the pane.
+ * @cls: (not nullable): colour class for the change label.
+ *
+ * Swaps the colour CSS class of the change label.
+ *
+ * Preconditions:
+ *  - @self is a constructed StkDetail; @cls is one of the static strings returned by
+ *    stk_change_class() (never NULL; the previous class is recognised by pointer comparison).
+ * Postconditions:
+ *  - the label carries @cls and no other colour class; self->shown_class is @cls; nothing happens
+ *    when it already was.
+ * Thread affinity: main thread only.
+ * Ownership: @cls is a static string, not copied or freed.
+ */
 static void
 set_change_class(StkDetail *self, const char *cls)
 {
@@ -72,6 +116,20 @@ set_change_class(StkDetail *self, const char *cls)
   gtk_widget_add_css_class(self->change_label, cls);
 }
 
+/**
+ * refresh_status:
+ * @self: (not nullable): the pane.
+ *
+ * Updates the "Offline"/"Stale" badge (offline takes precedence) and the chart's stale marker.
+ *
+ * Preconditions:
+ *  - @self is a constructed, not disposed StkDetail; self->item is NULL or a live item.
+ * Postconditions:
+ *  - the badge is visible with "Offline" or "Stale", or hidden when neither applies; the chart is
+ *    marked stale iff offline or the item is stale.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ */
 static void
 refresh_status(StkDetail *self)
 {
@@ -83,6 +141,21 @@ refresh_status(StkDetail *self)
   stk_chart_set_stale(STK_CHART(self->chart), self->offline || stale);
 }
 
+/**
+ * refresh_chart:
+ * @self: (not nullable): the pane.
+ *
+ * Gives the chart the item's detail series while the item's detail range equals the selected
+ * range, otherwise no series.
+ *
+ * Preconditions:
+ *  - @self is a constructed, not disposed StkDetail; self->item is NULL or a live item.
+ * Postconditions:
+ *  - self->shown_series is that series with one reference of the pane's own (the previous one is
+ *    released) and the chart was given it; nothing happens when the series is already shown.
+ * Thread affinity: main thread only.
+ * Ownership: the series stays with the item; the pane takes its own reference.
+ */
 static void
 refresh_chart(StkDetail *self)
 {
@@ -98,6 +171,21 @@ refresh_chart(StkDetail *self)
   stk_chart_set_series(STK_CHART(self->chart), series);
 }
 
+/**
+ * refresh_quote:
+ * @self: (not nullable): the pane.
+ *
+ * Re-renders the price, the change text, its colour class and the caption from the item's quote
+ * (a missing quote shows the em dash).
+ *
+ * Preconditions:
+ *  - @self is a constructed, not disposed StkDetail.
+ * Postconditions:
+ *  - nothing happens when there is no item; otherwise the three labels reflect the quote. The
+ *    caption label is hidden when the caption is empty.
+ * Thread affinity: main thread only.
+ * Ownership: the quote is borrowed from the item; all strings are freed locally.
+ */
 static void
 refresh_quote(StkDetail *self)
 {
@@ -123,15 +211,49 @@ refresh_quote(StkDetail *self)
   gtk_widget_set_visible(self->caption_label, caption[0] != '\0');
 }
 
+/**
+ * set_range_buttons:
+ * @self: (not nullable): the pane.
+ * @range: the range to select.
+ *
+ * Selects the range button without emitting "range-changed" (the "toggled" handler is muted).
+ *
+ * Preconditions:
+ *  - @self is a constructed StkDetail that is not disposed (dispose clears range_buttons[]) and
+ *    @range is STK_RANGE_1D..STK_RANGE_1Y. A violation is a programming error: a critical is
+ *    logged and nothing is changed.
+ * Postconditions:
+ *  - the button of @range is active and self->range is @range.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ */
 static void
 set_range_buttons(StkDetail *self, StkRange range)
 {
+  /* Only stk_detail_set_item() calls this, with a constant range; the check keeps the index and
+   * the button pointer valid should that ever change or the pane be disposed. */
+  g_return_if_fail((guint)range < N_RANGES && self->range_buttons[range] != NULL);
   self->updating_range = TRUE;
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->range_buttons[range]), TRUE);
   self->updating_range = FALSE;
   self->range = range;
 }
 
+/**
+ * on_item_changed:
+ * @self: (not nullable): the pane (receiver of the swapped "changed" connection to the item; the
+ *   item argument the signal also passes is not used).
+ *
+ * Refreshes the texts, badge and stale marker after the item's quote or stale flag changed.
+ *
+ * Preconditions:
+ *  - @self is not disposed: the connection is removed by disconnect_item() when the item is
+ *    replaced and by stk_detail_dispose().
+ * Postconditions:
+ *  - refresh_quote() and refresh_status() ran.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ */
 static void
 on_item_changed(StkDetail *self)
 {
@@ -139,12 +261,41 @@ on_item_changed(StkDetail *self)
   refresh_status(self);
 }
 
+/**
+ * on_item_detail_changed:
+ * @self: (not nullable): the pane (receiver of the swapped "detail-changed" connection to the
+ *   item; the item argument the signal also passes is not used).
+ *
+ * Refreshes the chart after the item's detail series or range changed.
+ *
+ * Preconditions:
+ *  - @self is not disposed (see on_item_changed()).
+ * Postconditions:
+ *  - refresh_chart() ran.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ */
 static void
 on_item_detail_changed(StkDetail *self)
 {
   refresh_chart(self);
 }
 
+/**
+ * disconnect_item:
+ * @self: (not nullable): the pane.
+ *
+ * Disconnects both item handlers and drops the pane's reference on the item.
+ *
+ * Preconditions:
+ *  - @self is a constructed StkDetail; when self->item is not NULL, changed_id and detail_id are
+ *    the live handler ids on it (set together by stk_detail_set_item()).
+ * Postconditions:
+ *  - self->item is NULL and both ids are 0; no handler of the item points at the pane. Calling it
+ *    again does nothing.
+ * Thread affinity: main thread only.
+ * Ownership: the pane's reference on the item is released.
+ */
 static void
 disconnect_item(StkDetail *self)
 {
@@ -156,6 +307,7 @@ disconnect_item(StkDetail *self)
   g_clear_object(&self->item);
 }
 
+/* Documented in stk-detail.h. */
 void
 stk_detail_set_item(StkDetail *self, StkRowItem *item)
 {
@@ -190,6 +342,7 @@ stk_detail_set_item(StkDetail *self, StkRowItem *item)
   gtk_stack_set_visible_child_name(GTK_STACK(self->stack), "content");
 }
 
+/* Documented in stk-detail.h. */
 StkRange
 stk_detail_get_range(StkDetail *self)
 {
@@ -197,6 +350,7 @@ stk_detail_get_range(StkDetail *self)
   return self->range;
 }
 
+/* Documented in stk-detail.h. */
 void
 stk_detail_set_offline(StkDetail *self, gboolean offline)
 {
@@ -212,6 +366,25 @@ stk_detail_set_offline(StkDetail *self, gboolean offline)
 /* Widget                                                                   */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * on_range_toggled:
+ * @button: the toggle button that changed.
+ * @user_data: (not nullable): the StkDetail, passed as user data by g_signal_connect_object() in
+ *   stk_detail_init(); disconnected by stk_detail_dispose().
+ *
+ * "toggled" handler of a range button: when the button became active and is not the current
+ * range, makes it the range, refreshes the chart and emits "range-changed" with its index. The
+ * index is that of the button in range_buttons[] (0 .. N_RANGES - 1), never external data.
+ *
+ * Preconditions:
+ *  - @user_data is a StkDetail that is not disposed (the handlers are removed by dispose first).
+ * Postconditions:
+ *  - nothing happens while the pane flips the buttons itself (updating_range), when the button
+ *    became inactive, or when it is already the current range; otherwise self->range is the
+ *    button's range and "range-changed" was emitted.
+ * Thread affinity: main thread only.
+ * Ownership: all parameters are borrowed for the call.
+ */
 static void
 on_range_toggled(GtkToggleButton *button, gpointer user_data)
 {
@@ -230,6 +403,23 @@ on_range_toggled(GtkToggleButton *button, gpointer user_data)
   }
 }
 
+/**
+ * stk_detail_dispose:
+ * @object: the pane being disposed.
+ *
+ * GObject dispose vfunc: disconnects the range buttons' handlers (and clears the pointers to the
+ * buttons), disconnects from the item and drops the pane's reference on it and on the shown
+ * series, then chains up. May run more than once.
+ *
+ * Preconditions:
+ *  - @object is a StkDetail; called by GObject (possibly repeatedly).
+ * Postconditions:
+ *  - range_buttons[] entries are NULL, the pane follows no item and holds no series; the parent
+ *    dispose has run. After this the public functions of the pane must not be called any more.
+ * Thread affinity: main thread only.
+ * Ownership: the item reference and the series reference held by the pane are released; the
+ *   buttons are owned by the widget tree.
+ */
 static void
 stk_detail_dispose(GObject *object)
 {
@@ -249,6 +439,20 @@ stk_detail_dispose(GObject *object)
   G_OBJECT_CLASS(stk_detail_parent_class)->dispose(object);
 }
 
+/**
+ * stk_detail_class_init:
+ * @klass: (not nullable): the class structure being initialised.
+ *
+ * GObject class initialiser: installs dispose() and registers "range-changed" (uint range,
+ * G_SIGNAL_RUN_LAST).
+ *
+ * Preconditions:
+ *  - called once by GObject while the type is registered.
+ * Postconditions:
+ *  - signals[SIGNAL_RANGE_CHANGED] holds the signal id.
+ * Thread affinity: main thread only.
+ * Ownership: @klass is owned by GObject.
+ */
 static void
 stk_detail_class_init(StkDetailClass *klass)
 {
@@ -258,6 +462,22 @@ stk_detail_class_init(StkDetailClass *klass)
                    NULL, G_TYPE_NONE, 1, G_TYPE_UINT);
 }
 
+/**
+ * make_label:
+ * @css_class: (not nullable): style class added to the label.
+ * @xalign: horizontal alignment, 0.0 (left) .. 1.0 (right).
+ *
+ * Creates a single-line label that ellipsizes at the end.
+ *
+ * Preconditions:
+ *  - GTK is initialised; @css_class is a NUL-terminated string; @xalign is in 0.0 .. 1.0.
+ * Postconditions:
+ *  - a new floating label is returned.
+ * Thread affinity: main thread only.
+ * Ownership: @css_class is borrowed (GTK copies it).
+ *
+ * Returns: (transfer floating): the new label.
+ */
 static GtkWidget *
 make_label(const char *css_class, float xalign)
 {
@@ -269,6 +489,22 @@ make_label(const char *css_class, float xalign)
   return label;
 }
 
+/**
+ * stk_detail_init:
+ * @self: (not nullable): the new pane (zero-filled by GObject).
+ *
+ * GObject instance initialiser: builds the placeholder page and the content page (labels, badge,
+ * the five grouped range buttons for 1D, 1M, 3M, 6M, 1Y, the chart) and shows the placeholder.
+ * The button handlers are connected after the 1D button was activated, so no signal is emitted
+ * here, and with g_signal_connect_object() and the pane as the object.
+ *
+ * Preconditions:
+ *  - called once by GObject for a new instance; GTK is initialised.
+ * Postconditions:
+ *  - range is STK_RANGE_1D, all widget pointers (range_buttons[0..N_RANGES-1]) are set, no item.
+ * Thread affinity: main thread only.
+ * Ownership: @self is owned by GObject; the widget owns the children.
+ */
 static void
 stk_detail_init(StkDetail *self)
 {
@@ -337,6 +573,7 @@ stk_detail_init(StkDetail *self)
   gtk_stack_set_visible_child_name(GTK_STACK(self->stack), "empty");
 }
 
+/* Documented in stk-detail.h. */
 GtkWidget *
 stk_detail_new(void)
 {

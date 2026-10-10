@@ -47,16 +47,40 @@
 
 G_BEGIN_DECLS
 
+/*
+ * G_DECLARE_FINAL_TYPE() below declares the types StkWindow and
+ * StkWindowClass, stk_window_get_type(), the inline cast function STK_WINDOW()
+ * and the inline type-check function STK_IS_WINDOW(), and the g_autoptr()
+ * cleanup for StkWindow. STK_TYPE_WINDOW is defined here. The type itself is
+ * defined by G_DEFINE_FINAL_TYPE() in stk-window.c.
+ */
 #define STK_TYPE_WINDOW (stk_window_get_type())
 G_DECLARE_FINAL_TYPE(StkWindow, stk_window, STK, WINDOW, GtkApplicationWindow)
 
 /**
  * stk_window_new:
- * @app: the application (not NULL); the window is added to it.
+ * @app: (not nullable): the application (must satisfy STK_IS_APP()); the
+ *   window is added to it.
+ *
+ * Builds the window (header bar, list, detail pane) and adds it to @app.
+ *
+ * Preconditions:
+ *  - @app satisfies STK_IS_APP() (else: critical, NULL returned, nothing is
+ *    created); GTK is initialised; main thread.
+ *  - @app outlives the window: the window keeps a borrowed pointer to it (no
+ *    reference) and uses it until it is finalized.
+ *  - the application's start-up load has finished (see the file comment).
+ * Postconditions:
+ *  - the window is registered with @app (gtk_window_set_application()) and
+ *    shows the application's current items; if there is at least one, the
+ *    first is selected (autoselect) and @app was told through
+ *    stk_app_select(); it is not shown yet.
+ * Thread affinity: main thread only.
+ * Ownership: @app is borrowed (not referenced); the returned window is owned
+ *   by the application's window list until it is closed or destroyed.
  *
  * Returns: (transfer none): the new window, not shown yet; call
- *   gtk_window_present(). It is owned by the application / toplevel list
- *   until it is closed or destroyed.
+ *   gtk_window_present(). NULL (with a critical) if @app is not a StkApp.
  */
 GtkWidget *stk_window_new(StkApp *app);
 

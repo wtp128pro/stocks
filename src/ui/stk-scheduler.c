@@ -59,6 +59,23 @@ struct _StkScheduler {
 /* Small helpers                                                            */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * sat_add:
+ * @a: first addend.
+ * @b: second addend.
+ *
+ * Adds two microsecond values without signed overflow.
+ *
+ * Preconditions:
+ *  - none; every gint64 pair is accepted.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: none (no pointers).
+ *
+ * Returns: @a + @b, or G_MAXINT64 / G_MININT64 when the exact sum would be
+ *   above / below the gint64 range.
+ */
 static gint64
 sat_add(gint64 a, gint64 b)
 {
@@ -69,6 +86,23 @@ sat_add(gint64 a, gint64 b)
   return a + b;
 }
 
+/**
+ * sat_sub:
+ * @a: minuend.
+ * @b: subtrahend.
+ *
+ * Subtracts two microsecond/millisecond values without signed overflow.
+ *
+ * Preconditions:
+ *  - none; every gint64 pair is accepted.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: none (no pointers).
+ *
+ * Returns: @a - @b, or G_MAXINT64 / G_MININT64 when the exact difference would
+ *   be above / below the gint64 range.
+ */
 static gint64
 sat_sub(gint64 a, gint64 b)
 {
@@ -79,19 +113,64 @@ sat_sub(gint64 a, gint64 b)
   return a - b;
 }
 
-/* Copies the upper-cased symbol into @out; FALSE if it is not valid. */
+/**
+ * normalise:
+ * @symbol: (nullable): candidate ticker (any case).
+ * @out: (out caller-allocates) (array fixed-size=16): receives the upper-cased
+ *   symbol; STK_SCHED_SYMBOL_BYTES bytes.
+ *
+ * Copies the upper-cased symbol into @out; FALSE if it is not valid. Every
+ * symbol buffer of the scheduler (Entry.symbol, sel_symbol and the keys that
+ * are compared with them) is produced here, which is what makes the fixed-size
+ * comparisons and copies of this file well defined.
+ *
+ * Preconditions:
+ *  - @symbol is NULL, NUL-terminated, or has at least 16 readable bytes (the
+ *    contract of stk_symbol_is_valid(), which is the only code that reads it
+ *    before the validity decision).
+ *  - @out points to STK_SCHED_SYMBOL_BYTES writable bytes.
+ * Postconditions:
+ *  - on TRUE: @out holds the symbol upper-cased, NUL-terminated at an index of
+ *    at most STK_SCHED_SYMBOL_BYTES - 1, and ALL STK_SCHED_SYMBOL_BYTES bytes
+ *    of @out are initialised (every byte after the NUL is 0), so the buffer can
+ *    be copied and compared as a whole (memcpy / memcmp).
+ *  - on FALSE: @out is untouched.
+ * Thread affinity: any thread (pure).
+ * Ownership: @symbol is borrowed; @out is filled for the caller.
+ *
+ * Returns: TRUE iff @symbol satisfies stk_symbol_is_valid().
+ */
 static gboolean
 normalise(const char *symbol, char out[STK_SCHED_SYMBOL_BYTES])
 {
   if (!stk_symbol_is_valid(symbol))
     return FALSE;
+  memset(out, 0, STK_SCHED_SYMBOL_BYTES);
   gsize i = 0;
-  for (; symbol[i] != '\0'; i++)
+  for (; i + 1 < STK_SCHED_SYMBOL_BYTES && symbol[i] != '\0'; i++)
     out[i] = g_ascii_toupper(symbol[i]);
   out[i] = '\0';
   return TRUE;
 }
 
+/**
+ * market_open:
+ * @wall_ms: wall-clock time, milliseconds since the Unix epoch UTC.
+ *
+ * stk_market_is_open() for any wall clock: a time outside the supported
+ * calendar counts as "market closed" (stk_market_is_open() would log a
+ * critical there).
+ *
+ * Preconditions:
+ *  - none; every gint64 is accepted.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: none (no pointers).
+ *
+ * Returns: TRUE iff @wall_ms is inside the supported calendar and the regular
+ *   session of that instant is open.
+ */
 static gboolean
 market_open(gint64 wall_ms)
 {
@@ -103,36 +182,126 @@ market_open(gint64 wall_ms)
   return stk_market_is_open(wall_ms);
 }
 
+/**
+ * is_active:
+ * @self: (not nullable): the scheduler.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler (every caller dereferences it first).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; @self is only read.
+ *
+ * Returns: TRUE iff the window is visible AND the network is available.
+ */
 static gboolean
 is_active(const StkScheduler *self)
 {
   return self->visible && self->online;
 }
 
+/**
+ * find_entry:
+ * @self: (not nullable): the scheduler.
+ * @key: (not nullable) (array fixed-size=16): a symbol buffer of
+ *   STK_SCHED_SYMBOL_BYTES initialised bytes, as produced by normalise() (or
+ *   the scheduler's own sel_symbol).
+ * @include_removed: whether entries kept only to hold a request slot count.
+ *
+ * Looks up the entry of a symbol. Symbols are compared as whole
+ * STK_SCHED_SYMBOL_BYTES buffers with memcmp(): that equals comparing the
+ * NUL-terminated strings because every Entry.symbol and every key is zero
+ * padded after its NUL (Entry.symbol is g_new0()-allocated and filled only by
+ * memcpy() of a normalise()d key; keys come from normalise()).
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler; @key points to STK_SCHED_SYMBOL_BYTES readable,
+ *    fully initialised bytes (zero after the NUL), as every caller passes it.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: the entry is owned by @self; @key is borrowed.
+ *
+ * Returns: (transfer none) (nullable): the first matching entry in display
+ *   order (removed ones only when @include_removed), or NULL.
+ */
 static Entry *
 find_entry(const StkScheduler *self, const char *key, gboolean include_removed)
 {
   for (guint i = 0; i < self->entries->len; i++) {
     Entry *e = g_ptr_array_index(self->entries, i);
-    if ((include_removed || !e->removed) && strcmp(e->symbol, key) == 0)
+    if ((include_removed || !e->removed) &&
+        memcmp(e->symbol, key, STK_SCHED_SYMBOL_BYTES) == 0)
       return e;
   }
   return NULL;
 }
 
+/**
+ * is_selected:
+ * @self: (not nullable): the scheduler.
+ * @e: (not nullable): an entry of @self.
+ *
+ * Preconditions:
+ *  - @self and @e are valid; @e->symbol and @self->sel_symbol are
+ *    zero-padded fixed buffers (see find_entry()): sel_symbol is g_new0()-zero
+ *    until stk_scheduler_set_selection() copies a normalise()d key into it.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; both pointers are only read.
+ *
+ * Returns: TRUE iff a symbol is selected, @e is not a removed entry and its
+ *   symbol equals the selected one (compared as whole buffers with memcmp()).
+ */
 static gboolean
 is_selected(const StkScheduler *self, const Entry *e)
 {
-  return self->has_sel && !e->removed && strcmp(e->symbol, self->sel_symbol) == 0;
+  return self->has_sel && !e->removed &&
+         memcmp(e->symbol, self->sel_symbol, STK_SCHED_SYMBOL_BYTES) == 0;
 }
 
+/**
+ * detail_valid:
+ * @self: (not nullable): the scheduler.
+ * @e: (not nullable): an entry of @self.
+ *
+ * Preconditions:
+ *  - @self and @e are valid (see is_selected()).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; both pointers are only read.
+ *
+ * Returns: TRUE iff @e is the selected entry and has a DETAIL job (a FUND has
+ *   none for STK_RANGE_1D).
+ */
 static gboolean
 detail_valid(const StkScheduler *self, const Entry *e)
 {
   return is_selected(self, e) && !(e->kind == STK_KIND_FUND && self->sel_range == STK_RANGE_1D);
 }
 
-/* Is a (not cancelled) request in flight that already delivers job @bit? */
+/**
+ * job_in_flight:
+ * @self: (not nullable): the scheduler.
+ * @e: (not nullable): an entry of @self.
+ * @bit: one WANT_QUOTE / WANT_SPARK / WANT_DETAIL constant.
+ *
+ * Is a (not cancelled) request in flight that already delivers job @bit?
+ *
+ * Preconditions:
+ *  - @self and @e are valid; @bit is one of the WANT_* constants (any other
+ *    value is answered FALSE by the switch).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; both pointers are only read.
+ *
+ * Returns: TRUE iff @e has a request in flight that is not being cancelled and
+ *   delivers @bit.
+ */
 static gboolean
 job_in_flight(const StkScheduler *self, const Entry *e, guint bit)
 {
@@ -150,7 +319,22 @@ job_in_flight(const StkScheduler *self, const Entry *e, guint bit)
   }
 }
 
-/* Marks job @bit as waiting unless it is already in flight. */
+/**
+ * want:
+ * @self: (not nullable): the scheduler.
+ * @e: (not nullable): an entry of @self.
+ * @bit: one WANT_* constant.
+ *
+ * Marks job @bit as waiting unless it is already in flight.
+ *
+ * Preconditions:
+ *  - @self and @e are valid; @bit is one WANT_* constant.
+ * Postconditions:
+ *  - @e->wants has @bit set unless job_in_flight() was TRUE for it (then it is
+ *    unchanged). Nothing else changes.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; @self is only read, @e is modified in place.
+ */
 static void
 want(const StkScheduler *self, Entry *e, guint bit)
 {
@@ -158,6 +342,23 @@ want(const StkScheduler *self, Entry *e, guint bit)
     e->wants |= bit;
 }
 
+/**
+ * emit:
+ * @self: (not nullable): the scheduler.
+ * @action: (not nullable): the action to queue.
+ *
+ * Appends a copy of @action to the pending actions, creating the array on
+ * first use.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler; @action points to a fully initialised
+ *    StkSchedAction (every caller memset()s it to 0 first).
+ * Postconditions:
+ *  - @self->actions is non-NULL and ends with a copy of @action.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: @action is borrowed and copied by value; the array is owned by
+ *   @self until stk_scheduler_take_actions() hands it over.
+ */
 static void
 emit(StkScheduler *self, const StkSchedAction *action)
 {
@@ -166,6 +367,23 @@ emit(StkScheduler *self, const StkSchedAction *action)
   g_array_append_val(self->actions, *action);
 }
 
+/**
+ * cancel_request:
+ * @self: (not nullable): the scheduler.
+ * @e: (not nullable): an entry of @self.
+ *
+ * Queues a CANCEL action for the request of @e, once. The request keeps its
+ * slot until stk_scheduler_request_done() reports it.
+ *
+ * Preconditions:
+ *  - @self and @e are valid.
+ * Postconditions:
+ *  - if @e has a request in flight that is not already cancelling: it is marked
+ *    cancelling and one CANCEL action carrying its id (symbol "") is queued;
+ *    otherwise nothing changes.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; @e is modified in place, the action is copied into @self.
+ */
 static void
 cancel_request(StkScheduler *self, Entry *e)
 {
@@ -183,6 +401,34 @@ cancel_request(StkScheduler *self, Entry *e)
 /* Starting requests                                                        */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * start_request:
+ * @self: (not nullable): the scheduler.
+ * @e: (not nullable): an entry of @self that is not removed and has no request.
+ * @is_quote: TRUE for a quote request, FALSE for a series request.
+ * @range: the series range (ignored for a quote request).
+ * @for_detail: whether the series request is also the DETAIL job.
+ *
+ * Issues a request for @e: queues the FETCH action with a fresh id, records the
+ * request in @e and takes a slot.
+ *
+ * Preconditions:
+ *  - @self and @e are valid; @e->req_id == 0 and @e is not removed; the caller
+ *    (start_next(), reached only from pump()) has checked that
+ *    @self->n_inflight < STK_SCHED_MAX_INFLIGHT and, for an INDEX entry, that
+ *    @self->n_inflight_index < STK_SCHED_MAX_INFLIGHT_INDEX.
+ *  - @e->symbol is NUL-terminated within its buffer (it comes from normalise()),
+ *    so the g_strlcpy() into the equally sized action buffer copies it whole.
+ * Postconditions:
+ *  - one FETCH_QUOTE / FETCH_SERIES action is queued; its id is
+ *    @self->next_id before the call, taken from a counter that starts at 1 and
+ *    is only incremented here, so ids are never 0 and are never reused (a wrap
+ *    would need 2^64 requests). The matching WANT_* bits of @e are cleared,
+ *    @self->n_inflight (and n_inflight_index when @e is an INDEX entry) is
+ *    incremented and @e->req_kind is the kind the request was issued with.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; the action is copied into @self.
+ */
 static void
 start_request(StkScheduler *self, Entry *e, gboolean is_quote, StkRange range, gboolean for_detail)
 {
@@ -214,9 +460,27 @@ start_request(StkScheduler *self, Entry *e, gboolean is_quote, StkRange range, g
   emit(self, &a);
 }
 
-/* Starts the highest-priority waiting job that has a free symbol slot.
+/**
+ * start_next:
+ * @self: (not nullable): the scheduler.
+ *
+ * Starts the highest-priority waiting job that has a free symbol slot.
  * Priority: the selection's QUOTE, the selection's DETAIL, every other QUOTE
- * (list order), every SPARK (list order). Returns FALSE if nothing started. */
+ * (list order), every SPARK (list order).
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler, active, with n_inflight below
+ *    STK_SCHED_MAX_INFLIGHT (the only caller, pump(), checks both).
+ * Postconditions:
+ *  - at most one request was started through start_request(); a waiting DETAIL
+ *    job of the selection that has no DETAIL job any more is dropped.
+ *    Waiting jobs of an INDEX symbol are left wanted while the index slot is
+ *    taken.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; the entries stay owned by @self.
+ *
+ * Returns: TRUE iff a request was started; FALSE if nothing started.
+ */
 static gboolean
 start_next(StkScheduler *self)
 {
@@ -266,6 +530,20 @@ start_next(StkScheduler *self)
   return FALSE;
 }
 
+/**
+ * pump:
+ * @self: (not nullable): the scheduler.
+ *
+ * Starts waiting jobs while the scheduler is active and a slot is free.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - when not active nothing happens; otherwise start_next() ran until it
+ *    started nothing or n_inflight reached STK_SCHED_MAX_INFLIGHT.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none.
+ */
 static void
 pump(StkScheduler *self)
 {
@@ -279,8 +557,26 @@ pump(StkScheduler *self)
 /* Rounds, time, deadline                                                   */
 /* ------------------------------------------------------------------------ */
 
-/* Has the latest request of job @bit of @e succeeded less than
- * STK_SCHED_MIN_EVENT_GAP_US before @now_us? */
+/**
+ * job_is_fresh:
+ * @e: (not nullable): an entry.
+ * @bit: exactly one WANT_* constant.
+ * @now_us: the current monotonic time, microseconds.
+ *
+ * Has the latest request of job @bit of @e succeeded less than
+ * STK_SCHED_MIN_EVENT_GAP_US before @now_us?
+ *
+ * Preconditions:
+ *  - @e is valid; @bit is exactly one of WANT_QUOTE, WANT_SPARK, WANT_DETAIL,
+ *    so g_bit_nth_lsf() yields the index 0..N_JOBS-1 into @e->ok_us. Its only
+ *    caller, add_round(), passes the constants of its static jobs[] table.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; @e is only read.
+ *
+ * Returns: TRUE iff the job is marked fresh and its age is below the gap.
+ */
 static gboolean
 job_is_fresh(const Entry *e, guint bit, gint64 now_us)
 {
@@ -288,9 +584,26 @@ job_is_fresh(const Entry *e, guint bit, gint64 now_us)
   return (e->fresh & bit) != 0 && sat_sub(now_us, e->ok_us[job]) < STK_SCHED_MIN_EVENT_GAP_US;
 }
 
-/* Records how a request ended for the jobs @jobs it delivered. A success
+/**
+ * record_result:
+ * @e: (not nullable): the entry whose request ended.
+ * @jobs: the WANT_* bits the request delivered.
+ * @result: how the request ended.
+ * @now_us: the current monotonic time, microseconds.
+ *
+ * Records how a request ended for the jobs @jobs it delivered. A success
  * makes a job fresh; a failure makes it stale and not fresh; a cancellation
- * changes nothing (the job simply never arrived). */
+ * changes nothing (the job simply never arrived).
+ *
+ * Preconditions:
+ *  - @e is valid; @jobs only contains WANT_* bits (bits outside the N_JOBS
+ *    jobs are ignored).
+ * Postconditions:
+ *  - OK: the jobs are not failed, are fresh and have ok_us == @now_us;
+ *    FAILED: they are failed and not fresh; CANCELLED: nothing changes.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; @e is modified in place.
+ */
 static void
 record_result(Entry *e, guint jobs, StkSchedResult result, gint64 now_us)
 {
@@ -309,14 +622,30 @@ record_result(Entry *e, guint jobs, StkSchedResult result, gint64 now_us)
   }
 }
 
-/* Event round (@event): every job. Periodic round: QUOTE and DETAIL of
+/**
+ * add_round:
+ * @self: (not nullable): the scheduler.
+ * @now: the current time.
+ * @event: TRUE for an event round, FALSE for a periodic round.
+ *
+ * Event round (@event): every job. Periodic round: QUOTE and DETAIL of
  * non-FUND symbols, and every job that failed (any symbol, funds included).
  * Each job is judged on its own: one whose latest request succeeded very
  * recently is skipped, any other (never fetched, cancelled, dropped by hide /
  * offline, failed) is wanted, whatever the state of the symbol's other jobs.
  * An event round that finds the market closed is itself the refresh after
  * the close, so the final round still owed to a pending deadline (see
- * stk_scheduler_tick()) is cancelled. */
+ * stk_scheduler_tick()) is cancelled.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - the selected jobs of every tracked (not removed) symbol are marked wanted
+ *    unless fresh or already in flight; for an event round with the market
+ *    closed the deadline is cleared. Nothing is started (pump() does that).
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; the entries stay owned by @self.
+ */
 static void
 add_round(StkScheduler *self, StkSchedTime now, gboolean event)
 {
@@ -340,7 +669,20 @@ add_round(StkScheduler *self, StkSchedTime now, gboolean event)
   }
 }
 
-/* Cancels everything in flight and forgets everything waiting. */
+/**
+ * drop_all:
+ * @self: (not nullable): the scheduler.
+ *
+ * Cancels everything in flight and forgets everything waiting.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - every entry has no waiting job; every request in flight that was not
+ *    already cancelling is marked cancelling with one CANCEL action queued.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; the entries stay owned by @self.
+ */
 static void
 drop_all(StkScheduler *self)
 {
@@ -351,8 +693,23 @@ drop_all(StkScheduler *self)
   }
 }
 
-/* Is there anything a periodic round would do: a non-FUND symbol, or a job
- * that failed? */
+/**
+ * has_periodic_work:
+ * @self: (not nullable): the scheduler.
+ *
+ * Is there anything a periodic round would do: a non-FUND symbol, or a job
+ * that failed?
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none; @self is only read.
+ *
+ * Returns: TRUE iff a tracked (not removed) entry is not a FUND or has a failed
+ *   job.
+ */
 static gboolean
 has_periodic_work(const StkScheduler *self)
 {
@@ -364,10 +721,25 @@ has_periodic_work(const StkScheduler *self)
   return FALSE;
 }
 
-/* Re-evaluates whether the periodic timer may exist. A deadline is armed only
+/**
+ * rearm:
+ * @self: (not nullable): the scheduler.
+ * @now: the current time.
+ *
+ * Re-evaluates whether the periodic timer may exist. A deadline is armed only
  * while the market is open; once armed it survives the close, because when it
  * fires it issues the one final round (see stk_scheduler_tick()). It is
- * never armed (or re-armed) while the market is closed. */
+ * never armed (or re-armed) while the market is closed.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - the deadline is -1 unless the scheduler is active and has periodic work;
+ *    when it was unset and the market is open it is @now.mono_us plus
+ *    STK_SCHED_PERIOD_US (saturating).
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none.
+ */
 static void
 rearm(StkScheduler *self, StkSchedTime now)
 {
@@ -377,7 +749,24 @@ rearm(StkScheduler *self, StkSchedTime now)
     self->deadline_us = sat_add(now.mono_us, STK_SCHED_PERIOD_US);
 }
 
-/* First step of every input: clock-jump detection. */
+/**
+ * advance:
+ * @self: (not nullable): the scheduler.
+ * @now: the current time.
+ *
+ * First step of every input: clock-jump detection. If a deadline is pending
+ * and the wall clock advanced more than STK_SCHED_JUMP_TOLERANCE_US more than
+ * the monotonic clock since the previous input (differences computed with
+ * saturating arithmetic), the deadline becomes due now.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - the deadline is @now.mono_us after a detected forward jump; @self->last is
+ *    @now and has_last is TRUE.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none.
+ */
 static void
 advance(StkScheduler *self, StkSchedTime now)
 {
@@ -391,6 +780,20 @@ advance(StkScheduler *self, StkSchedTime now)
   self->has_last = TRUE;
 }
 
+/**
+ * finish:
+ * @self: (not nullable): the scheduler.
+ * @now: the current time.
+ *
+ * Last step of every input: starts waiting jobs and re-evaluates the timer.
+ *
+ * Preconditions:
+ *  - @self is a valid scheduler.
+ * Postconditions:
+ *  - pump() and rearm() have run.
+ * Thread affinity: the thread that owns the scheduler (main thread).
+ * Ownership: none.
+ */
 static void
 finish(StkScheduler *self, StkSchedTime now)
 {
@@ -402,6 +805,7 @@ finish(StkScheduler *self, StkSchedTime now)
 /* Public API                                                               */
 /* ------------------------------------------------------------------------ */
 
+/* Documented in stk-scheduler.h. */
 StkScheduler *
 stk_scheduler_new(void)
 {
@@ -413,6 +817,7 @@ stk_scheduler_new(void)
   return self;
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_free(StkScheduler *self)
 {
@@ -424,6 +829,7 @@ stk_scheduler_free(StkScheduler *self)
   g_free(self);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_set_symbols(StkScheduler *self, StkSchedTime now, const StkSchedSymbol *symbols,
                           gsize n)
@@ -441,14 +847,15 @@ stk_scheduler_set_symbols(StkScheduler *self, StkSchedTime now, const StkSchedSy
       continue;
     gboolean dup = FALSE;
     for (guint j = 0; j < next->len && !dup; j++)
-      dup = strcmp(((const Entry *)g_ptr_array_index(next, j))->symbol, key) == 0;
+      dup = memcmp(((const Entry *)g_ptr_array_index(next, j))->symbol, key,
+                   STK_SCHED_SYMBOL_BYTES) == 0;
     if (dup)
       continue;
 
     Entry *e = NULL;
     for (guint j = 0; j < self->entries->len && e == NULL; j++) {
       Entry *c = g_ptr_array_index(self->entries, j);
-      if (strcmp(c->symbol, key) == 0)
+      if (memcmp(c->symbol, key, STK_SCHED_SYMBOL_BYTES) == 0)
         e = g_ptr_array_steal_index(self->entries, j);
     }
     gboolean fresh = e == NULL || e->removed; /* new, or revived while its request winds down */
@@ -489,6 +896,7 @@ stk_scheduler_set_symbols(StkScheduler *self, StkSchedTime now, const StkSchedSy
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_set_selection(StkScheduler *self, StkSchedTime now, const char *symbol,
                             StkRange range)
@@ -500,7 +908,7 @@ stk_scheduler_set_selection(StkScheduler *self, StkSchedTime now, const char *sy
   char key[STK_SCHED_SYMBOL_BYTES];
   gboolean has_sel = normalise(symbol, key);
   if (has_sel == self->has_sel && range == self->sel_range &&
-      (!has_sel || strcmp(key, self->sel_symbol) == 0)) {
+      (!has_sel || memcmp(key, self->sel_symbol, STK_SCHED_SYMBOL_BYTES) == 0)) {
     finish(self, now);
     return;
   }
@@ -537,6 +945,7 @@ stk_scheduler_set_selection(StkScheduler *self, StkSchedTime now, const char *sy
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_set_visible(StkScheduler *self, StkSchedTime now, gboolean visible)
 {
@@ -553,6 +962,7 @@ stk_scheduler_set_visible(StkScheduler *self, StkSchedTime now, gboolean visible
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_set_online(StkScheduler *self, StkSchedTime now, gboolean online)
 {
@@ -569,6 +979,7 @@ stk_scheduler_set_online(StkScheduler *self, StkSchedTime now, gboolean online)
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_focus_regained(StkScheduler *self, StkSchedTime now)
 {
@@ -579,6 +990,7 @@ stk_scheduler_focus_regained(StkScheduler *self, StkSchedTime now)
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_tick(StkScheduler *self, StkSchedTime now)
 {
@@ -599,6 +1011,7 @@ stk_scheduler_tick(StkScheduler *self, StkSchedTime now)
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 void
 stk_scheduler_request_done(StkScheduler *self, StkSchedTime now, guint64 id, StkSchedResult result)
 {
@@ -642,6 +1055,7 @@ stk_scheduler_request_done(StkScheduler *self, StkSchedTime now, guint64 id, Stk
   finish(self, now);
 }
 
+/* Documented in stk-scheduler.h. */
 GArray *
 stk_scheduler_take_actions(StkScheduler *self)
 {
@@ -651,6 +1065,7 @@ stk_scheduler_take_actions(StkScheduler *self)
   return out;
 }
 
+/* Documented in stk-scheduler.h. */
 gint64
 stk_scheduler_next_wakeup_us(StkScheduler *self)
 {
@@ -658,6 +1073,7 @@ stk_scheduler_next_wakeup_us(StkScheduler *self)
   return self->deadline_us;
 }
 
+/* Documented in stk-scheduler.h. */
 gboolean
 stk_scheduler_is_stale(StkScheduler *self, const char *symbol)
 {
@@ -669,6 +1085,7 @@ stk_scheduler_is_stale(StkScheduler *self, const char *symbol)
   return e != NULL && e->failed != 0;
 }
 
+/* Documented in stk-scheduler.h. */
 guint
 stk_scheduler_n_inflight(StkScheduler *self)
 {
@@ -676,6 +1093,7 @@ stk_scheduler_n_inflight(StkScheduler *self)
   return self->n_inflight;
 }
 
+/* Documented in stk-scheduler.h. */
 gboolean
 stk_sched_series_is_hollow(const StkSeries *fresh, const StkSeries *held)
 {

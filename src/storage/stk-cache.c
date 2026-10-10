@@ -12,7 +12,11 @@
 #define N_RANGES ((guint)STK_RANGE_1Y + 1)
 #define MAX_CURRENCY_BYTES 8
 
-/* Per-symbol data. Also used (without lru_link) for save snapshots. */
+/* Size of a buffer for an upper-cased symbol: the longest symbol accepted by
+ * stk_symbol_is_valid() is 15 bytes, plus the NUL. */
+#define SYMBOL_BUF_LEN 16
+G_STATIC_ASSERT(SYMBOL_BUF_LEN >= 15 + 1);
+
 /* Source tag of stk_cache_save_async() tasks; only its address is used. */
 static char save_tag;
 
@@ -21,6 +25,7 @@ typedef struct {
   gint64 fetched_ms;
 } SeriesSlot;
 
+/* Per-symbol data. Also used (without lru_link) for save snapshots. */
 typedef struct {
   char *symbol; /* upper-case, valid */
   StkQuote *quote; /* NULL when absent */
@@ -47,12 +52,50 @@ struct _StkCache {
   gboolean save_in_flight;
 };
 
+/*
+ * G_DEFINE_TYPE(StkCache, stk_cache, G_TYPE_OBJECT) generates the following (checked with gcc -E
+ * of this file with the project's compile flags):
+ *  - GType stk_cache_get_type(void): returns the GType of StkCache and registers it on the first
+ *    call, inside a once-initialisation guard, by calling stk_cache_get_type_once().
+ *    Thread affinity: any thread. Ownership: none (no pointers).
+ *  - static GType stk_cache_get_type_once(void): performs the registration for
+ *    stk_cache_get_type().
+ *    Thread affinity: only via stk_cache_get_type(). Ownership: none (no pointers).
+ *  - static void stk_cache_class_intern_init(gpointer klass): @klass is the class structure being
+ *    initialised (borrowed, written; nothing is retained). It stores the parent class in
+ *    stk_cache_parent_class, adjusts the private offset only if StkCache_private_offset is
+ *    non-zero, then calls stk_cache_class_init(). Called by GObject once per type, from the
+ *    thread that first uses the type. Ownership: @klass belongs to GObject.
+ *  - static gpointer stk_cache_parent_class: NULL until class_intern_init() runs; used by
+ *    finalize() to chain up.
+ *  - static gint StkCache_private_offset: stays 0 (no G_ADD_PRIVATE is used).
+ *  - static inline gpointer stk_cache_get_instance_private(StkCache *self): returns self plus the
+ *    private offset; unused here (G_GNUC_UNUSED). @self is borrowed. Thread affinity: any
+ *    thread.
+ */
 G_DEFINE_TYPE(StkCache, stk_cache, G_TYPE_OBJECT)
 
 /* ------------------------------------------------------------------------ */
 /* Entries and LRU                                                          */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * entry_free:
+ * @data: an Entry created by find_or_create() or snapshot_take().
+ *
+ * GDestroyNotify of the symbol table and of the snapshot array: drops the
+ * series references, frees the quote, the symbol and the entry.
+ *
+ * Preconditions:
+ *  - @data is a non-NULL, heap-allocated Entry owned by the caller (the
+ *    container that frees it passes each element exactly once); its series
+ *    slots are NULL or hold one reference each.
+ * Postconditions:
+ *  - the entry and everything it owns is released.
+ * Thread affinity: any thread (the snapshot may be freed on the worker or on
+ *   the main thread; series references are atomic).
+ * Ownership: consumes @data.
+ */
 static void
 entry_free(gpointer data)
 {
@@ -65,6 +108,21 @@ entry_free(gpointer data)
   g_free(e);
 }
 
+/**
+ * stk_cache_finalize:
+ * @object: the StkCache being finalized.
+ *
+ * GObject finalize: clears the LRU queue, releases the symbol table (which
+ * frees the entries) and the path, then chains up.
+ *
+ * Preconditions:
+ *  - @object is a StkCache whose last reference was dropped; no save is
+ *    running (the save tasks hold a reference on the cache).
+ * Postconditions:
+ *  - all memory owned by the cache is freed; the parent finalize has run.
+ * Thread affinity: the thread that drops the last reference.
+ * Ownership: the cache owns its path, table and entries; all are released.
+ */
 static void
 stk_cache_finalize(GObject *object)
 {
@@ -75,12 +133,40 @@ stk_cache_finalize(GObject *object)
   G_OBJECT_CLASS(stk_cache_parent_class)->finalize(object);
 }
 
+/**
+ * stk_cache_class_init:
+ * @klass: the class structure being initialised.
+ *
+ * GObject class_init: installs finalize.
+ *
+ * Preconditions:
+ *  - called once by the GType system.
+ * Postconditions:
+ *  - the finalize vfunc is set.
+ * Thread affinity: the thread that first uses the type (GType serialises it).
+ * Ownership: none (the class is owned by GType).
+ */
 static void
 stk_cache_class_init(StkCacheClass *klass)
 {
   G_OBJECT_CLASS(klass)->finalize = stk_cache_finalize;
 }
 
+/**
+ * stk_cache_init:
+ * @self: the instance being initialised.
+ *
+ * GObject instance init: creates the symbol table (owning its entries) and
+ * initialises the LRU queue.
+ *
+ * Preconditions:
+ *  - @self is a zero-initialised new instance.
+ * Postconditions:
+ *  - by_symbol is an empty table that frees entries with entry_free(); lru is
+ *    an empty queue; path is still NULL (set by stk_cache_new()).
+ * Thread affinity: the creating thread.
+ * Ownership: the instance owns the new table.
+ */
 static void
 stk_cache_init(StkCache *self)
 {
@@ -88,6 +174,7 @@ stk_cache_init(StkCache *self)
   g_queue_init(&self->lru);
 }
 
+/* Documented in stk-cache.h. */
 StkCache *
 stk_cache_new(const char *path)
 {
@@ -97,6 +184,7 @@ stk_cache_new(const char *path)
   return self;
 }
 
+/* Documented in stk-cache.h. */
 const char *
 stk_cache_get_path(StkCache *self)
 {
@@ -104,6 +192,7 @@ stk_cache_get_path(StkCache *self)
   return self->path;
 }
 
+/* Documented in stk-cache.h. */
 guint
 stk_cache_get_n_symbols(StkCache *self)
 {
@@ -111,6 +200,22 @@ stk_cache_get_n_symbols(StkCache *self)
   return g_hash_table_size(self->by_symbol);
 }
 
+/**
+ * touch:
+ * @self: the cache.
+ * @e: an entry of @self.
+ *
+ * Makes @e the most recently used entry (moves its link to the queue tail).
+ *
+ * Preconditions:
+ *  - @e is an entry of @self with a non-NULL lru_link that is currently in
+ *    self->lru (true for every entry created by find_or_create(); snapshot
+ *    entries are never passed here).
+ * Postconditions:
+ *  - @e is the tail of the LRU queue; no entry is added or removed.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: none transferred; the link stays owned by the queue.
+ */
 static void
 touch(StkCache *self, Entry *e)
 {
@@ -120,27 +225,81 @@ touch(StkCache *self, Entry *e)
   }
 }
 
-static void
+/**
+ * evict_oldest:
+ * @self: the cache.
+ *
+ * Removes the least recently used entry with all its data.
+ *
+ * Preconditions:
+ *  - @self is a valid cache; every entry of by_symbol is in self->lru and
+ *    total_points is the sum of the entries' n_points (so the subtraction
+ *    cannot underflow); the call sites only call it while the table is
+ *    non-empty, which makes the queue non-empty too.
+ * Postconditions:
+ *  - on TRUE: the head entry is removed from the queue and the table (and
+ *    freed) and total_points is reduced by its points.
+ *  - on FALSE (queue unexpectedly empty): nothing changed.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: the evicted entry is freed by the table.
+ *
+ * Returns: TRUE if an entry was evicted; FALSE if the queue was empty (the
+ *   callers stop their loops then, instead of dereferencing NULL or spinning).
+ */
+static gboolean
 evict_oldest(StkCache *self)
 {
   Entry *e = g_queue_pop_head(&self->lru);
+  if (e == NULL)
+    return FALSE;
   self->total_points -= e->n_points;
   g_hash_table_remove(self->by_symbol, e->symbol); /* frees e */
+  return TRUE;
 }
 
-/* Evicts least recently used symbols until the limits hold; the most recently
- * used symbol is never evicted by the points limit. */
+/**
+ * enforce_limits:
+ * @self: the cache.
+ *
+ * Evicts least recently used symbols until the limits hold; the most recently
+ * used symbol is never evicted by the points limit.
+ *
+ * Preconditions:
+ *  - @self is a valid cache.
+ * Postconditions:
+ *  - at most STK_CACHE_MAX_SYMBOLS symbols are held, and either at most
+ *    STK_CACHE_MAX_TOTAL_POINTS points or a single symbol.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: evicted entries are freed.
+ */
 static void
 enforce_limits(StkCache *self)
 {
-  while (g_hash_table_size(self->by_symbol) > STK_CACHE_MAX_SYMBOLS)
-    evict_oldest(self);
-  while (self->total_points > STK_CACHE_MAX_TOTAL_POINTS && g_hash_table_size(self->by_symbol) > 1)
-    evict_oldest(self);
+  while (g_hash_table_size(self->by_symbol) > STK_CACHE_MAX_SYMBOLS && evict_oldest(self))
+    ;
+  while (self->total_points > STK_CACHE_MAX_TOTAL_POINTS && g_hash_table_size(self->by_symbol) > 1 &&
+         evict_oldest(self))
+    ;
 }
 
-/* @upper: valid, upper-case. Returns the entry as most recently used,
- * creating it when missing. */
+/**
+ * find_or_create:
+ * @self: the cache.
+ * @upper: (not nullable): valid, upper-case symbol.
+ *
+ * Returns the entry as most recently used, creating it when missing.
+ *
+ * Preconditions:
+ *  - @self is a valid cache; @upper is NUL-terminated and valid.
+ * Postconditions:
+ *  - the entry for @upper exists and is the tail of the LRU queue; a new
+ *    entry is empty (no quote, no series). The limits are NOT enforced here.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: @upper is borrowed (copied for a new entry); the entry is owned
+ *   by the cache.
+ *
+ * Returns: (transfer none): the entry; never NULL.
+ */
 static Entry *
 find_or_create(StkCache *self, const char *upper)
 {
@@ -157,6 +316,21 @@ find_or_create(StkCache *self, const char *upper)
   return e;
 }
 
+/**
+ * clear_all:
+ * @self: the cache.
+ *
+ * Removes every entry.
+ *
+ * Preconditions:
+ *  - @self is a valid cache.
+ * Postconditions:
+ *  - the queue and table are empty, total_points is 0; the generation
+ *    counters are not changed.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: all entries are freed (the queue is cleared first, so no entry's
+ *   lru_link is used afterwards).
+ */
 static void
 clear_all(StkCache *self)
 {
@@ -165,16 +339,53 @@ clear_all(StkCache *self)
   self->total_points = 0;
 }
 
-/* @symbol must satisfy stk_symbol_is_valid() (so it is at most 15 bytes). */
+/**
+ * upcase_symbol:
+ * @symbol: (not nullable): ticker.
+ * @out: (out) (array fixed-size=16): buffer of SYMBOL_BUF_LEN bytes. (A C
+ *   array parameter decays to a pointer, so the size is NOT visible to the
+ *   compiler here; it is enforced by the loop bound below.)
+ *
+ * Writes the ASCII-upper-cased @symbol and a NUL into @out. At most
+ * SYMBOL_BUF_LEN - 1 bytes are copied, so @out can never be overrun even if
+ * the symbol were longer; a longer symbol would be silently truncated.
+ *
+ * Preconditions:
+ *  - @symbol is NUL-terminated and satisfies stk_symbol_is_valid() (1..15
+ *    bytes; every call site validates it first, so the truncation cannot
+ *    happen); @out has room for SYMBOL_BUF_LEN bytes (every call site passes
+ *    a local char[SYMBOL_BUF_LEN]).
+ * Postconditions:
+ *  - @out holds the upper-cased symbol followed by a NUL; @symbol is not
+ *    modified.
+ * Thread affinity: any thread (touches only @out).
+ * Ownership: both pointers are borrowed for the call only.
+ */
 static void
-upcase_symbol(const char *symbol, char out[16])
+upcase_symbol(const char *symbol, char out[SYMBOL_BUF_LEN])
 {
   gsize i = 0;
-  for (; symbol[i] != '\0'; i++)
+  for (; i < SYMBOL_BUF_LEN - 1 && symbol[i] != '\0'; i++)
     out[i] = g_ascii_toupper(symbol[i]);
   out[i] = '\0';
 }
 
+/**
+ * age_since:
+ * @fetched_ms: fetch time, ms since the Unix epoch.
+ *
+ * Milliseconds elapsed according to the system clock, clamped to >= 0.
+ *
+ * Preconditions:
+ *  - @fetched_ms >= 0 (put_*() and the loader reject negative values), so the
+ *    subtraction cannot overflow.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (reads the clock only).
+ * Ownership: none (no pointers).
+ *
+ * Returns: now - @fetched_ms in ms, or 0 if that is negative.
+ */
 static gint64
 age_since(gint64 fetched_ms)
 {
@@ -186,16 +397,51 @@ age_since(gint64 fetched_ms)
 /* Validation shared by put and load                                        */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * name_is_valid:
+ * @name: (nullable): display name candidate.
+ *
+ * Checks the length bound with memchr() inside the first
+ * STK_CACHE_MAX_NAME_BYTES + 1 bytes (never scans further, equivalent to
+ * a length check against the bound) and then UTF-8 validity.
+ *
+ * Preconditions:
+ *  - @name is NULL or NUL-terminated (callers: a caller's quote, or a JSON
+ *    string).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: @name is borrowed for the call only.
+ *
+ * Returns: TRUE iff @name is non-NULL, at most STK_CACHE_MAX_NAME_BYTES bytes
+ *   long and valid UTF-8.
+ */
 static gboolean
 name_is_valid(const char *name)
 {
-  return name != NULL && strlen(name) <= STK_CACHE_MAX_NAME_BYTES && g_utf8_validate(name, -1, NULL);
+  return name != NULL && memchr(name, '\0', STK_CACHE_MAX_NAME_BYTES + 1) != NULL &&
+         g_utf8_validate(name, -1, NULL);
 }
 
+/**
+ * currency_is_valid:
+ * @c: (nullable): currency code candidate.
+ *
+ * Preconditions:
+ *  - @c is NULL or NUL-terminated.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: @c is borrowed for the call only.
+ *
+ * Returns: TRUE iff @c is 1..MAX_CURRENCY_BYTES ASCII letters or digits. The
+ *   length is bounded with memchr() inside the first MAX_CURRENCY_BYTES + 1
+ *   bytes, so no more is read.
+ */
 static gboolean
 currency_is_valid(const char *c)
 {
-  if (c == NULL || c[0] == '\0' || strlen(c) > MAX_CURRENCY_BYTES)
+  if (c == NULL || c[0] == '\0' || memchr(c, '\0', MAX_CURRENCY_BYTES + 1) == NULL)
     return FALSE;
   for (; *c != '\0'; c++)
     if (!g_ascii_isalnum(*c))
@@ -203,6 +449,22 @@ currency_is_valid(const char *c)
   return TRUE;
 }
 
+/**
+ * quote_is_storable:
+ * @q: (not nullable): quote to check.
+ *
+ * Preconditions:
+ *  - @q is non-NULL (call site: stk_cache_put_quote() checks it); its strings
+ *    are NULL or NUL-terminated.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: @q is borrowed for the call only.
+ *
+ * Returns: TRUE iff the symbol, kind, name, currency, price/change/change_pct
+ *   (NAN allowed, infinity not) and as_of_ms satisfy the requirements of
+ *   stk_cache_put_quote().
+ */
 static gboolean
 quote_is_storable(const StkQuote *q)
 {
@@ -215,6 +477,7 @@ quote_is_storable(const StkQuote *q)
 /* Put / get                                                                */
 /* ------------------------------------------------------------------------ */
 
+/* Documented in stk-cache.h. */
 gboolean
 stk_cache_put_quote(StkCache *self, const StkQuote *quote, gint64 fetched_at_ms)
 {
@@ -222,7 +485,7 @@ stk_cache_put_quote(StkCache *self, const StkQuote *quote, gint64 fetched_at_ms)
   if (quote == NULL || fetched_at_ms < 0 || !quote_is_storable(quote))
     return FALSE;
 
-  char upper[16];
+  char upper[SYMBOL_BUF_LEN];
   upcase_symbol(quote->symbol, upper);
   Entry *e = find_or_create(self, upper);
   stk_quote_free(e->quote);
@@ -235,13 +498,14 @@ stk_cache_put_quote(StkCache *self, const StkQuote *quote, gint64 fetched_at_ms)
   return TRUE;
 }
 
+/* Documented in stk-cache.h. */
 StkQuote *
 stk_cache_get_quote(StkCache *self, const char *symbol, gint64 *age_ms)
 {
   g_return_val_if_fail(STK_IS_CACHE(self), NULL);
   if (!stk_symbol_is_valid(symbol))
     return NULL;
-  char upper[16];
+  char upper[SYMBOL_BUF_LEN];
   upcase_symbol(symbol, upper);
   Entry *e = g_hash_table_lookup(self->by_symbol, upper);
   if (e == NULL || e->quote == NULL)
@@ -252,6 +516,7 @@ stk_cache_get_quote(StkCache *self, const char *symbol, gint64 *age_ms)
   return stk_quote_copy(e->quote);
 }
 
+/* Documented in stk-cache.h. */
 gboolean
 stk_cache_put_series(StkCache *self, const char *symbol, StkSeries *series, gint64 fetched_at_ms)
 {
@@ -260,7 +525,7 @@ stk_cache_put_series(StkCache *self, const char *symbol, StkSeries *series, gint
       (guint)series->range >= N_RANGES || series->n_points > STK_CACHE_MAX_SERIES_POINTS)
     return FALSE;
 
-  char upper[16];
+  char upper[SYMBOL_BUF_LEN];
   upcase_symbol(symbol, upper);
   Entry *e = find_or_create(self, upper);
   SeriesSlot *slot = &e->slots[series->range];
@@ -278,13 +543,14 @@ stk_cache_put_series(StkCache *self, const char *symbol, StkSeries *series, gint
   return TRUE;
 }
 
+/* Documented in stk-cache.h. */
 StkSeries *
 stk_cache_get_series(StkCache *self, const char *symbol, StkRange range, gint64 *age_ms)
 {
   g_return_val_if_fail(STK_IS_CACHE(self), NULL);
   if (!stk_symbol_is_valid(symbol) || (guint)range >= N_RANGES)
     return NULL;
-  char upper[16];
+  char upper[SYMBOL_BUF_LEN];
   upcase_symbol(symbol, upper);
   Entry *e = g_hash_table_lookup(self->by_symbol, upper);
   if (e == NULL || e->slots[range].series == NULL)
@@ -295,6 +561,7 @@ stk_cache_get_series(StkCache *self, const char *symbol, StkRange range, gint64 
   return stk_series_ref(e->slots[range].series);
 }
 
+/* Documented in stk-cache.h. */
 gboolean
 stk_cache_is_dirty(StkCache *self)
 {
@@ -307,6 +574,18 @@ stk_cache_is_dirty(StkCache *self)
 /* snapshot)                                                                */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * snapshot_free:
+ * @snap: the snapshot to free.
+ *
+ * Preconditions:
+ *  - @snap was returned by snapshot_take() and is freed exactly once.
+ * Postconditions:
+ *  - the entry array (and through entry_free() every private copy and series
+ *    reference) and the snapshot are freed.
+ * Thread affinity: any thread (series references are atomic).
+ * Ownership: consumes @snap.
+ */
 static void
 snapshot_free(Snapshot *snap)
 {
@@ -314,8 +593,29 @@ snapshot_free(Snapshot *snap)
   g_free(snap);
 }
 
+/* Generated g_autoptr(Snapshot) support: calls snapshot_free(). */
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(Snapshot, snapshot_free)
 
+/**
+ * snapshot_take:
+ * @self: the cache.
+ *
+ * Takes a private copy of the cache for saving: quotes are deep-copied, series
+ * are shared by taking one reference each (their points are never modified
+ * after being stored), entries are in LRU order (least recently used first).
+ *
+ * Preconditions:
+ *  - @self is a valid cache owned by the calling thread.
+ * Postconditions:
+ *  - the snapshot records the generation and the total point count of @self
+ *    (at most STK_CACHE_MAX_TOTAL_POINTS: put_*() and the loader keep the
+ *    limits); the cache is not modified.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: the caller owns the returned snapshot (free with
+ *   snapshot_free()).
+ *
+ * Returns: (transfer full): the new snapshot.
+ */
 static Snapshot *
 snapshot_take(StkCache *self)
 {
@@ -338,8 +638,22 @@ snapshot_take(StkCache *self)
   return snap;
 }
 
-/* Shortest of %.15g/%.16g/%.17g that reads back bit-identical; null if not
- * finite (JSON has no NaN/Infinity). */
+/**
+ * append_double:
+ * @out: the document being built.
+ * @v: any double.
+ *
+ * Appends the shortest of %.15g/%.16g/%.17g that reads back bit-identical;
+ * "null" if not finite (JSON has no NaN/Infinity); "-0.0" for negative zero.
+ *
+ * Preconditions:
+ *  - @out is a valid #GString not used by another thread meanwhile.
+ * Postconditions:
+ *  - one JSON number or null has been appended; the buffer of at least
+ *    G_ASCII_DTOSTR_BUF_SIZE bytes is large enough for every formatted value.
+ * Thread affinity: any thread (touches only @out).
+ * Ownership: @out stays owned by the caller.
+ */
 static void
 append_double(GString *out, double v)
 {
@@ -362,6 +676,22 @@ append_double(GString *out, double v)
   g_string_append(out, buf);
 }
 
+/**
+ * append_series:
+ * @out: the document being built.
+ * @slot: a slot whose series is non-NULL.
+ *
+ * Appends the JSON object of one series: fetch time, previous close and the
+ * parallel arrays of times and values.
+ *
+ * Preconditions:
+ *  - @out is a valid #GString not used by another thread meanwhile;
+ *    @slot->series is non-NULL (call site: snapshot_serialize() checks it).
+ * Postconditions:
+ *  - the object has been appended; the series is not modified.
+ * Thread affinity: any thread (touches only @out and reads the snapshot).
+ * Ownership: both pointers are borrowed for the call only.
+ */
 static void
 append_series(GString *out, const SeriesSlot *slot)
 {
@@ -383,6 +713,24 @@ append_series(GString *out, const SeriesSlot *slot)
   g_string_append(out, "]}");
 }
 
+/**
+ * append_quote:
+ * @out: the document being built.
+ * @e: an entry whose quote is non-NULL.
+ *
+ * Appends the JSON object of the entry's quote. Strings go through
+ * stk_json_append_string().
+ *
+ * Preconditions:
+ *  - @out is a valid #GString not used by another thread meanwhile;
+ *    @e->quote is non-NULL with non-NULL name and currency (call site:
+ *    snapshot_serialize() checks the quote; put_quote() and the loader
+ *    validated the strings).
+ * Postconditions:
+ *  - the object has been appended; the entry is not modified.
+ * Thread affinity: any thread (touches only @out and reads the snapshot).
+ * Ownership: both pointers are borrowed for the call only.
+ */
 static void
 append_quote(GString *out, const Entry *e)
 {
@@ -402,15 +750,41 @@ append_quote(GString *out, const Entry *e)
   g_string_append_c(out, '}');
 }
 
-/* Returns the document (g_free()); fails only if it would exceed the load limit.
- * Size bound: at most STK_CACHE_MAX_TOTAL_POINTS points, each at most 20 (time)
- * + 25 (value) + 2 (commas) bytes, plus < 4 KiB per entry for symbol, quote
- * (a 256-byte name escapes to at most 1536 bytes) and per-series framing, with
- * at most STK_CACHE_MAX_SYMBOLS entries: below 13 MiB. */
+/**
+ * snapshot_serialize:
+ * @snap: the snapshot to write.
+ * @len: (not nullable) (out): receives the document length in bytes.
+ * @error: (nullable): return location for a #GError, may be NULL.
+ *
+ * Serialises the snapshot to the JSON document; fails only if it would exceed
+ * the load limit.
+ * The initial allocation
+ * hint is computed in gsize (g_string_sized_new() takes a gsize): n_points is
+ * at most STK_CACHE_MAX_TOTAL_POINTS and entries->len at most
+ * STK_CACHE_MAX_SYMBOLS (both enforced by enforce_limits() before any
+ * snapshot is taken), so the sum cannot overflow.
+ *
+ * Size bound: at most STK_CACHE_MAX_TOTAL_POINTS points, each at most 20 (time) + 25 (value) + 2
+ * (commas) bytes, plus < 4 KiB per entry for symbol, quote (a 256-byte name escapes to at most
+ * 1536 bytes) and per-series framing, with at most STK_CACHE_MAX_SYMBOLS entries: below 13 MiB.
+ *
+ * Preconditions:
+ *  - @snap comes from snapshot_take() and is not modified meanwhile; every
+ *    entry has a valid symbol and, if a quote is present, valid strings.
+ * Postconditions:
+ *  - on non-NULL: *@len is the length of the returned text.
+ *  - on NULL: @error (if non-NULL) is set (G_IO_ERROR /
+ *    G_IO_ERROR_MESSAGE_TOO_LARGE); *@len is untouched; nothing leaks.
+ * Thread affinity: any thread (touches only the snapshot and the result).
+ * Ownership: @snap is borrowed; the caller owns the returned buffer.
+ *
+ * Returns: (transfer full) (nullable): the NUL-terminated document (g_free()),
+ *   or NULL if it exceeds STK_CACHE_MAX_FILE_BYTES.
+ */
 static char *
 snapshot_serialize(const Snapshot *snap, gsize *len, GError **error)
 {
-  GString *out = g_string_sized_new(512 + snap->n_points * 24 + snap->entries->len * 400);
+  GString *out = g_string_sized_new(512 + snap->n_points * 24 + (gsize)snap->entries->len * 400);
   g_string_append_printf(out, "{\"version\":%d,\"entries\":[", CACHE_VERSION);
   for (guint i = 0; i < snap->entries->len; i++) {
     const Entry *e = g_ptr_array_index(snap->entries, i);
@@ -446,6 +820,27 @@ snapshot_serialize(const Snapshot *snap, gsize *len, GError **error)
   return g_string_free(out, FALSE);
 }
 
+/**
+ * snapshot_write:
+ * @snap: the snapshot to write.
+ * @path: (not nullable): destination file.
+ * @error: (nullable): return location for a #GError, may be NULL.
+ *
+ * Serialises @snap and stores it with stk_file_write_atomic().
+ *
+ * Preconditions:
+ *  - @snap comes from snapshot_take() and is not modified meanwhile; @path is
+ *    non-empty and NUL-terminated; @error is NULL or points to a NULL
+ *    #GError pointer.
+ * Postconditions:
+ *  - on TRUE: the file at @path holds the document; on FALSE: @error (if
+ *    non-NULL) is set and the previous file is intact; the temporary text
+ *    buffer is freed either way.
+ * Thread affinity: any thread (the save worker or the owner of the cache).
+ * Ownership: @snap and @path are borrowed for the call only.
+ *
+ * Returns: TRUE if the file was replaced.
+ */
 static gboolean
 snapshot_write(const Snapshot *snap, const char *path, GError **error)
 {
@@ -458,6 +853,20 @@ snapshot_write(const Snapshot *snap, const char *path, GError **error)
 /* Load                                                                     */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * node_get_i64:
+ * @n: (nullable): JSON node.
+ * @out: (out): receives the value.
+ *
+ * Preconditions:
+ *  - @n is NULL or a node of a live parser; @out is non-NULL.
+ * Postconditions:
+ *  - on TRUE: *@out is the integer; on FALSE: *@out is untouched.
+ * Thread affinity: any thread (touches only the node's reader state).
+ * Ownership: @n is borrowed.
+ *
+ * Returns: TRUE iff @n is a JSON integer value.
+ */
 static gboolean
 node_get_i64(JsonNode *n, gint64 *out)
 {
@@ -467,7 +876,27 @@ node_get_i64(JsonNode *n, gint64 *out)
   return TRUE;
 }
 
-/* Number (int or double) that is finite, or null -> NAN when @allow_null. */
+/**
+ * node_get_double:
+ * @n: (nullable): JSON node.
+ * @allow_null: whether a JSON null is acceptable (read as NAN).
+ * @out: (out): receives the value.
+ *
+ * Reads a number (int or double) that is finite, or null -> NAN when
+ * @allow_null.
+ *
+ * Preconditions:
+ *  - @n is NULL or a node of a live parser; @out is non-NULL.
+ * Postconditions:
+ *  - *@out is written for a null node (NAN) and for a number node (the value
+ *    even if it is not finite, in which case the result is FALSE); for any
+ *    other node, or NULL, *@out is untouched. So *@out is meaningful only
+ *    when the result is TRUE.
+ * Thread affinity: any thread (touches only the node's reader state).
+ * Ownership: @n is borrowed.
+ *
+ * Returns: TRUE iff @n is a finite number, or a null with @allow_null.
+ */
 static gboolean
 node_get_double(JsonNode *n, gboolean allow_null, double *out)
 {
@@ -486,6 +915,20 @@ node_get_double(JsonNode *n, gboolean allow_null, double *out)
   return isfinite(*out);
 }
 
+/**
+ * node_get_bool:
+ * @n: (nullable): JSON node.
+ * @out: (out): receives the value.
+ *
+ * Preconditions:
+ *  - @n is NULL or a node of a live parser; @out is non-NULL.
+ * Postconditions:
+ *  - on TRUE: *@out is the boolean; on FALSE: *@out is untouched.
+ * Thread affinity: any thread (touches only the node's reader state).
+ * Ownership: @n is borrowed.
+ *
+ * Returns: TRUE iff @n is a JSON boolean value.
+ */
 static gboolean
 node_get_bool(JsonNode *n, gboolean *out)
 {
@@ -495,6 +938,21 @@ node_get_bool(JsonNode *n, gboolean *out)
   return TRUE;
 }
 
+/**
+ * node_get_string:
+ * @n: (nullable): JSON node.
+ *
+ * Preconditions:
+ *  - @n is NULL or a node of a live parser.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (touches only the node's reader state).
+ * Ownership: the returned string belongs to the node (and its parser); it is
+ *   valid as long as the parser lives.
+ *
+ * Returns: (transfer none) (nullable): the string value, or NULL if @n is not
+ *   a string value.
+ */
 static const char *
 node_get_string(JsonNode *n)
 {
@@ -503,13 +961,50 @@ node_get_string(JsonNode *n)
   return json_node_get_string(n);
 }
 
+/**
+ * node_get_object:
+ * @n: (nullable): JSON node.
+ *
+ * Preconditions:
+ *  - @n is NULL or a node of a live parser.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (touches only the node's reader state).
+ * Ownership: the returned object belongs to the node.
+ *
+ * Returns: (transfer none) (nullable): the object, or NULL if @n is not an
+ *   object.
+ */
 static JsonObject *
 node_get_object(JsonNode *n)
 {
   return n != NULL && JSON_NODE_HOLDS_OBJECT(n) ? json_node_get_object(n) : NULL;
 }
 
-/* Returns a valid quote for @symbol or NULL. */
+/**
+ * parse_quote:
+ * @symbol: (not nullable): upper-case, valid symbol of the entry.
+ * @node: (nullable): JSON node of the "quote" member.
+ * @fetched_ms: (out): receives the fetch time.
+ *
+ * Builds a valid quote for @symbol from the stored object, or NULL.
+ *
+ * Preconditions:
+ *  - @symbol is valid (stk_quote_new() requires it); @node is NULL or a node
+ *    of a live parser; @fetched_ms is non-NULL.
+ * Postconditions:
+ *  - on non-NULL: *@fetched_ms is the stored fetch time (>= 0).
+ *  - on NULL: *@fetched_ms is written only if the "fetched_at_ms" member was
+ *    an integer, and may then be negative or belong to a quote rejected for
+ *    another reason; callers must not use it (load_entry() only keeps it
+ *    together with a non-NULL quote).
+ * Thread affinity: any thread (touches only the parsed tree).
+ * Ownership: the caller owns the returned quote (stk_quote_free()); @node is
+ *   borrowed.
+ *
+ * Returns: (transfer full) (nullable): the quote, or NULL if the object is
+ *   missing or any field is invalid.
+ */
 static StkQuote *
 parse_quote(const char *symbol, JsonNode *node, gint64 *fetched_ms)
 {
@@ -543,7 +1038,31 @@ parse_quote(const char *symbol, JsonNode *node, gint64 *fetched_ms)
   return q;
 }
 
-/* Returns a valid series for @range or NULL. */
+/**
+ * parse_series:
+ * @range: the range of the series; a valid StkRange.
+ * @node: (nullable): JSON node of one "series" member.
+ * @fetched_ms: (out): receives the fetch time.
+ *
+ * Builds a valid series for @range from the stored object, or NULL: both
+ * arrays must have the same length of at most STK_CACHE_MAX_SERIES_POINTS,
+ * times must be integers and values finite numbers, and the points must pass
+ * stk_series_append() (ascending times).
+ *
+ * Preconditions:
+ *  - @range < N_RANGES (call site: loop over r < N_RANGES); @node is NULL or
+ *    a node of a live parser; @fetched_ms is non-NULL.
+ * Postconditions:
+ *  - on non-NULL: *@fetched_ms is the stored fetch time (>= 0).
+ *  - on NULL: *@fetched_ms is written only if the "fetched_at_ms" member was
+ *    an integer, and may then be negative; callers must not use it. A series
+ *    under construction is released.
+ * Thread affinity: any thread (touches only the parsed tree).
+ * Ownership: the caller owns the returned series (one reference); @node is
+ *   borrowed.
+ *
+ * Returns: (transfer full) (nullable): the series, or NULL if invalid.
+ */
 static StkSeries *
 parse_series(StkRange range, JsonNode *node, gint64 *fetched_ms)
 {
@@ -576,8 +1095,31 @@ parse_series(StkRange range, JsonNode *node, gint64 *fetched_ms)
   return s;
 }
 
-/* Adds one stored entry as most recently used; silently skips invalid parts
- * and symbols already in @seen (accepted earlier in this load). */
+/**
+ * load_entry:
+ * @self: the cache.
+ * @seen: (element-type utf8 void): symbols accepted earlier in this load.
+ * @node: (nullable): JSON node of one array element.
+ *
+ * Adds one stored entry as most recently used; silently skips invalid parts
+ * and symbols already in @seen (accepted earlier in this load). An entry
+ * with neither a valid quote nor a valid series is skipped. For a rejected
+ * quote or series the fetch time that parse_quote()/parse_series() may have
+ * written is stored next to a NULL quote/series, where nothing reads it
+ * (get_*() and the serialiser test the quote/series pointer first).
+ *
+ * Preconditions:
+ *  - @self is a valid cache; @seen is the table owned by load_document();
+ *    @node is NULL or a node of a live parser.
+ * Postconditions:
+ *  - on acceptance: the entry exists as the most recently used one, holds the
+ *    parsed quote and series, its points are counted in n_points and
+ *    total_points, and the symbol has been added to @seen. The limits are
+ *    enforced by the caller afterwards.
+ *  - otherwise: the cache and @seen are unchanged; nothing leaks.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: @node is borrowed; parsed objects move into the cache entry.
+ */
 static void
 load_entry(StkCache *self, GHashTable *seen, JsonNode *node)
 {
@@ -587,7 +1129,7 @@ load_entry(StkCache *self, GHashTable *seen, JsonNode *node)
   const char *symbol = node_get_string(json_object_get_member(o, "symbol"));
   if (!stk_symbol_is_valid(symbol))
     return;
-  char upper[16];
+  char upper[SYMBOL_BUF_LEN];
   upcase_symbol(symbol, upper);
   if (g_hash_table_contains(seen, upper))
     return;
@@ -624,6 +1166,27 @@ load_entry(StkCache *self, GHashTable *seen, JsonNode *node)
   }
 }
 
+/**
+ * load_document:
+ * @self: the (empty) cache.
+ * @root: (nullable): root node of the parsed document.
+ * @error: (nullable): return location for a #GError, may be NULL.
+ *
+ * Checks the top-level object, "version" and "entries" and offers every
+ * element to load_entry(), enforcing the limits after each one.
+ *
+ * Preconditions:
+ *  - @self is empty and valid; @root is NULL or a node owned by a live
+ *    JsonParser; @error is NULL or points to a NULL #GError pointer.
+ * Postconditions:
+ *  - on TRUE: the cache holds the valid entries within the limits.
+ *  - on FALSE: @error (if non-NULL) is set (STK_ERROR / STK_ERROR_PARSE);
+ *    nothing was added.
+ * Thread affinity: the thread that owns the cache.
+ * Ownership: @root is borrowed; nothing is retained.
+ *
+ * Returns: TRUE if the document has the expected shape and version.
+ */
 static gboolean
 load_document(StkCache *self, JsonNode *root, GError **error)
 {
@@ -662,12 +1225,28 @@ load_document(StkCache *self, JsonNode *root, GError **error)
   return TRUE;
 }
 
+/**
+ * pending_error:
+ *
+ * Builds the error returned while an asynchronous save is running.
+ *
+ * Preconditions:
+ *  - none.
+ * Postconditions:
+ *  - a new GError (G_IO_ERROR / G_IO_ERROR_PENDING) exists; nothing else
+ *    changes.
+ * Thread affinity: any thread (pure).
+ * Ownership: no pointer parameters; the caller owns the returned error.
+ *
+ * Returns: (transfer full): the new error.
+ */
 static GError *
 pending_error(void)
 {
   return g_error_new_literal(G_IO_ERROR, G_IO_ERROR_PENDING, "cache: an asynchronous save is running");
 }
 
+/* Documented in stk-cache.h. */
 gboolean
 stk_cache_load(StkCache *self, GError **error)
 {
@@ -708,6 +1287,7 @@ stk_cache_load(StkCache *self, GError **error)
 /* Save                                                                     */
 /* ------------------------------------------------------------------------ */
 
+/* Documented in stk-cache.h. */
 gboolean
 stk_cache_save(StkCache *self, GError **error)
 {
@@ -725,11 +1305,29 @@ stk_cache_save(StkCache *self, GError **error)
   return TRUE;
 }
 
+/* Data of one asynchronous save; owned by the inner GTask as task data. */
 typedef struct {
   Snapshot *snap;
   GTask *outer; /* the task handed to the caller, completed in save_done() */
 } SaveJob;
 
+/**
+ * save_job_free:
+ * @job: the job to free.
+ *
+ * GDestroyNotify of the inner task's data: frees the snapshot, drops the
+ * reference on the outer task and frees the job.
+ *
+ * Preconditions:
+ *  - @job was created by stk_cache_save_async() and is freed exactly once (by
+ *    the inner GTask, after both save_worker() and save_done() are done with
+ *    it).
+ * Postconditions:
+ *  - the snapshot, the job and the reference on the outer task are released.
+ * Thread affinity: any thread (the inner task may be finalised on the worker
+ *   or on the thread that ran save_done()).
+ * Ownership: consumes @job and its snapshot; releases the outer task.
+ */
 static void
 save_job_free(SaveJob *job)
 {
@@ -738,6 +1336,29 @@ save_job_free(SaveJob *job)
   g_free(job);
 }
 
+/**
+ * save_worker:
+ * @task: the inner task.
+ * @source: (type StkCache): the cache the task was created for.
+ * @task_data: the SaveJob.
+ * @cancellable: (nullable): unused; cancellation is read through @task.
+ *
+ * GTaskThreadFunc: serialises the private snapshot and writes it atomically
+ * to the cache's path. Returns the cancellation error instead if the task was
+ * cancelled before it started.
+ *
+ * Preconditions:
+ *  - runs on a GTask worker thread; @source is kept alive by @task; its path
+ *    is never modified after construction (so reading it here is race free);
+ *    @task_data is the SaveJob whose snapshot nothing else mutates meanwhile
+ *    (the shared series are only read).
+ * Postconditions:
+ *  - @task is completed exactly once: TRUE, the cancellation error or the
+ *    error of snapshot_write().
+ * Thread affinity: worker thread only.
+ * Ownership: @task_data stays owned by the task; the error from the write is
+ *   handed to the task.
+ */
 static void
 save_worker(GTask *task, gpointer source, gpointer task_data, GCancellable *cancellable)
 {
@@ -752,6 +1373,28 @@ save_worker(GTask *task, gpointer source, gpointer task_data, GCancellable *canc
     g_task_return_error(task, error);
 }
 
+/**
+ * save_done:
+ * @source: (type StkCache): the cache.
+ * @result: the finished inner task.
+ * @user_data: unused.
+ *
+ * GAsyncReadyCallback of the inner task, run in the main context of the
+ * thread that called stk_cache_save_async(): clears save_in_flight, marks the
+ * cache saved as of the snapshot generation on success, and completes the
+ * caller's outer task with the same outcome.
+ *
+ * Preconditions:
+ *  - @source is the cache and @result its inner task, whose task data is the
+ *    SaveJob; runs in the thread that owns the cache.
+ * Postconditions:
+ *  - save_in_flight is FALSE; on success saved_gen is the generation of the
+ *    snapshot (the cache stays dirty if put_*() ran since); the outer task
+ *    has been completed once.
+ * Thread affinity: the thread that owns the cache (main thread).
+ * Ownership: the error obtained from the inner task is handed to the outer
+ *   task; nothing else is retained.
+ */
 static void
 save_done(GObject *source, GAsyncResult *result, gpointer user_data)
 {
@@ -774,6 +1417,7 @@ save_done(GObject *source, GAsyncResult *result, gpointer user_data)
     g_task_return_error(outer, error);
 }
 
+/* Documented in stk-cache.h. */
 void
 stk_cache_save_async(StkCache *self, GCancellable *cancellable, GAsyncReadyCallback callback,
                      gpointer user_data)
@@ -802,6 +1446,7 @@ stk_cache_save_async(StkCache *self, GCancellable *cancellable, GAsyncReadyCallb
   g_object_unref(inner);
 }
 
+/* Documented in stk-cache.h. */
 gboolean
 stk_cache_save_finish(StkCache *self, GAsyncResult *result, GError **error)
 {

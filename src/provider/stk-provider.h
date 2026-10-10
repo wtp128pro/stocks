@@ -47,7 +47,7 @@
  *    sample by its START time (the sample labelled with the closing time is
  *    the first after-hours minute and is not returned). prev_close is the
  *    previous session's close, derived from the same provider's quote as
- *    quote price - quote change (see stk_nasdaq.h for why); NAN when that is
+ *    quote price - quote change (see stk-nasdaq.h for why); NAN when that is
  *    unavailable. A failing quote lookup never fails the series.
  *  - StkSeries for STK_RANGE_1M/3M/6M/1Y: one point per trading day, valid
  *    for every kind; t_ms is 00:00 UTC of the trading day's calendar date
@@ -78,7 +78,22 @@ typedef struct {
   StkKind kind;
 } StkSearchHit;
 
-/** Frees @hit and its strings. NULL is allowed (no-op). */
+/**
+ * stk_search_hit_free:
+ * @hit: (nullable) (transfer full): the hit to free; NULL is a no-op.
+ *
+ * Frees @hit and its strings.
+ *
+ * Preconditions:
+ *  - @hit is NULL or a StkSearchHit whose @symbol and @name are NULL or
+ *    g_malloc()-allocated and owned by the hit, and @hit itself was
+ *    g_malloc()-allocated (as the providers' search parsers create it).
+ *  - @hit is not used afterwards (it is freed exactly once).
+ * Postconditions:
+ *  - @hit, @hit->symbol and @hit->name are freed; with NULL nothing happens.
+ * Thread affinity: any thread (touches only @hit).
+ * Ownership: takes ownership of @hit and the strings it owns.
+ */
 void stk_search_hit_free(StkSearchHit *hit);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(StkSearchHit, stk_search_hit_free)
@@ -95,7 +110,10 @@ G_DECLARE_INTERFACE(StkProvider, stk_provider, STK, PROVIDER, GObject)
  * @search_async: see stk_provider_search_async().
  * @search_finish: see stk_provider_search_finish().
  *
- * Every virtual function is mandatory.
+ * Every virtual function is mandatory. The dispatch functions
+ * (stk_provider_fetch_quote_async() etc.) check that the implementation
+ * filled in the virtual function they need and, if not, report a
+ * g_return_*_if_fail() critical and do nothing.
  */
 struct _StkProviderInterface {
   GTypeInterface parent_iface;
@@ -128,6 +146,24 @@ struct _StkProviderInterface {
  * @user_data: passed to @callback.
  *
  * Starts fetching the current quote of @symbol.
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_PROVIDER() and implements fetch_quote_async;
+ *    @symbol is a NUL-terminated string (non-NULL); @cancellable is NULL or a
+ *    GCancellable.
+ *  - Called from the thread that runs the GLib main context.
+ * Postconditions:
+ *  - Violating the first precondition line is a critical and nothing is
+ *    started. Otherwise @callback is invoked exactly once, later, in the
+ *    thread-default main context of the caller, with the result to pass to
+ *    stk_provider_fetch_quote_finish(); bad arguments are reported through
+ *    it (see the file comment).
+ * Thread affinity: main thread only (the thread running the GLib main
+ *   context).
+ * Ownership: @symbol is copied by the implementation; the implementation
+ *   takes its own references to @self and @cancellable as it needs them
+ *   (the caller keeps its own); @user_data is
+ *   not owned or freed here and must stay valid until @callback has run.
  */
 void stk_provider_fetch_quote_async(StkProvider *self, const char *symbol, StkKind kind,
                                     GCancellable *cancellable, GAsyncReadyCallback callback,
@@ -138,6 +174,24 @@ void stk_provider_fetch_quote_async(StkProvider *self, const char *symbol, StkKi
  * @self: the provider passed to the async call.
  * @result: the GAsyncResult given to the callback.
  * @error: (nullable): return location for a GError.
+ *
+ * Collects the result of stk_provider_fetch_quote_async().
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_PROVIDER() and implements fetch_quote_finish;
+ *    @result satisfies G_IS_ASYNC_RESULT() and is the result handed to the
+ *    callback of a quote operation started on @self; it is finished at most
+ *    once.
+ *  - @error is NULL or points to a NULL GError*.
+ *  - Called from the thread that runs the GLib main context.
+ * Postconditions:
+ *  - On success *@error is untouched and the quote is returned; on failure
+ *    NULL is returned and, if @error is non-NULL, *@error is set (STK_ERROR
+ *    domain, or G_IO_ERROR_CANCELLED).
+ * Thread affinity: main thread only (the thread running the GLib main
+ *   context).
+ * Ownership: @self and @result stay with the caller; the quote is returned
+ *   to the caller.
  *
  * Returns: (transfer full): the quote (release with stk_quote_free()), or
  *   NULL with @error set.
@@ -158,6 +212,24 @@ StkQuote *stk_provider_fetch_quote_finish(StkProvider *self, GAsyncResult *resul
  * @user_data: passed to @callback.
  *
  * Starts fetching the chart series of @symbol for @range.
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_PROVIDER() and implements fetch_series_async;
+ *    @symbol is a NUL-terminated string (non-NULL); @cancellable is NULL or a
+ *    GCancellable.
+ *  - Called from the thread that runs the GLib main context.
+ * Postconditions:
+ *  - Violating the first precondition line is a critical and nothing is
+ *    started. Otherwise @callback is invoked exactly once, later, in the
+ *    thread-default main context of the caller, with the result to pass to
+ *    stk_provider_fetch_series_finish(); bad arguments are reported through
+ *    it (see the file comment).
+ * Thread affinity: main thread only (the thread running the GLib main
+ *   context).
+ * Ownership: @symbol is copied by the implementation; the implementation
+ *   takes its own references to @self and @cancellable as it needs them
+ *   (the caller keeps its own); @user_data is
+ *   not owned or freed here and must stay valid until @callback has run.
  */
 void stk_provider_fetch_series_async(StkProvider *self, const char *symbol, StkKind kind,
                                      StkRange range, GCancellable *cancellable,
@@ -168,6 +240,24 @@ void stk_provider_fetch_series_async(StkProvider *self, const char *symbol, StkK
  * @self: the provider passed to the async call.
  * @result: the GAsyncResult given to the callback.
  * @error: (nullable): return location for a GError.
+ *
+ * Collects the result of stk_provider_fetch_series_async().
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_PROVIDER() and implements fetch_series_finish;
+ *    @result satisfies G_IS_ASYNC_RESULT() and is the result handed to the
+ *    callback of a series operation started on @self; it is finished at most
+ *    once.
+ *  - @error is NULL or points to a NULL GError*.
+ *  - Called from the thread that runs the GLib main context.
+ * Postconditions:
+ *  - On success *@error is untouched; on failure NULL is returned and, if
+ *    @error is non-NULL, *@error is set (STK_ERROR domain, or
+ *    G_IO_ERROR_CANCELLED).
+ * Thread affinity: main thread only (the thread running the GLib main
+ *   context).
+ * Ownership: @self and @result stay with the caller; the series is returned
+ *   to the caller.
  *
  * Returns: (transfer full): the series (release with stk_series_unref());
  *   series->range equals the requested range. NULL with @error set on
@@ -188,6 +278,24 @@ StkSeries *stk_provider_fetch_series_finish(StkProvider *self, GAsyncResult *res
  * @user_data: passed to @callback.
  *
  * Starts a symbol/name search.
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_PROVIDER() and implements search_async; @text is
+ *    a NUL-terminated string (non-NULL); @cancellable is NULL or a
+ *    GCancellable.
+ *  - Called from the thread that runs the GLib main context.
+ * Postconditions:
+ *  - Violating the first precondition line is a critical and nothing is
+ *    started. Otherwise @callback is invoked exactly once, later, in the
+ *    thread-default main context of the caller, with the result to pass to
+ *    stk_provider_search_finish(); bad arguments are reported through it
+ *    (see the file comment).
+ * Thread affinity: main thread only (the thread running the GLib main
+ *   context).
+ * Ownership: @text is copied by the implementation; the implementation
+ *   takes its own references to @self and @cancellable as it needs them
+ *   (the caller keeps its own); @user_data is not owned or freed here and
+ *   must stay valid until @callback has run.
  */
 void stk_provider_search_async(StkProvider *self, const char *text, GCancellable *cancellable,
                                GAsyncReadyCallback callback, gpointer user_data);
@@ -197,6 +305,24 @@ void stk_provider_search_async(StkProvider *self, const char *text, GCancellable
  * @self: the provider passed to the async call.
  * @result: the GAsyncResult given to the callback.
  * @error: (nullable): return location for a GError.
+ *
+ * Collects the result of stk_provider_search_async().
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_PROVIDER() and implements search_finish;
+ *    @result satisfies G_IS_ASYNC_RESULT() and is the result handed to the
+ *    callback of a search operation started on @self; it is finished at most
+ *    once.
+ *  - @error is NULL or points to a NULL GError*.
+ *  - Called from the thread that runs the GLib main context.
+ * Postconditions:
+ *  - On success *@error is untouched; on failure NULL is returned and, if
+ *    @error is non-NULL, *@error is set (STK_ERROR domain, or
+ *    G_IO_ERROR_CANCELLED).
+ * Thread affinity: main thread only (the thread running the GLib main
+ *   context).
+ * Ownership: @self and @result stay with the caller; the array is returned
+ *   to the caller.
  *
  * Returns: (transfer full) (element-type StkSearchHit): array of hits in the
  *   provider's order (possibly empty), each freed by the array

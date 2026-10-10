@@ -18,8 +18,28 @@
 /* Time zone helpers                                                        */
 /* ------------------------------------------------------------------------ */
 
-/* Shared immutable America/New_York zone (same fallback rule as stk-market),
- * created once on first use and never freed. */
+/**
+ * ny_tz:
+ *
+ * Shared immutable America/New_York zone (same fallback rule as stk-market),
+ * created once on first use and never freed. If neither the zone name nor the
+ * POSIX fallback rule can be created, NULL is remembered and returned; no
+ * substitute zone such as UTC is used (it would shift every label by 4-5
+ * hours).
+ *
+ * Preconditions:
+ *  - none.
+ * Postconditions:
+ *  - returns the same value on every call. This replaces a former
+ *    g_assert(tz != NULL): callers (zone_datetime(), hence every 1D label and
+ *    tick function) now treat NULL as their normal failure value (em dash / 0
+ *    ticks).
+ * Thread affinity: any thread (one-time initialisation via g_once_init_enter).
+ * Ownership: (transfer none) - owned by this file for the process lifetime;
+ *   the caller must not unref it.
+ *
+ * Returns: (nullable): the shared zone, or NULL if it is unavailable.
+ */
 static GTimeZone *
 ny_tz(void)
 {
@@ -28,10 +48,11 @@ ny_tz(void)
     GTimeZone *tz = g_time_zone_new_identifier("America/New_York");
     if (tz == NULL)
       tz = g_time_zone_new_identifier("EST5EDT,M3.2.0,M11.1.0");
-    g_assert(tz != NULL);
-    g_once_init_leave(&tz_once, (gsize)tz);
+    /* 1 is the "unavailable" marker: g_once_init_leave() needs a non-zero value
+     * and no valid (aligned) pointer equals 1. */
+    g_once_init_leave(&tz_once, tz != NULL ? (gsize)tz : 1);
   }
-  return (GTimeZone *)tz_once;
+  return tz_once == 1 ? NULL : (GTimeZone *)tz_once;
 }
 
 /* Unix seconds of 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z: GDateTime's
@@ -40,10 +61,30 @@ ny_tz(void)
 #define MIN_VALID_SECS G_GINT64_CONSTANT(-62135596800)
 #define MAX_VALID_SECS G_GINT64_CONSTANT(253402300799)
 
-/* Local date-time of @ms in @tz, or NULL outside GDateTime's range. */
+/**
+ * zone_datetime:
+ * @tz: (nullable): zone to express the instant in.
+ * @ms: instant, epoch ms.
+ *
+ * Local date-time of @ms in @tz, or NULL outside GDateTime's range.
+ *
+ * Preconditions:
+ *  - none; any @ms is accepted (the floor to seconds cannot overflow).
+ * Postconditions:
+ *  - returns NULL when @tz is NULL (a NULL zone, i.e. an unavailable New York
+ *    zone, was previously a g_assert() abort in ny_tz()), when @ms is outside
+ *    the years 1..9999, or on a GLib failure. No state is changed.
+ * Thread affinity: any thread (the shared zones are immutable).
+ * Ownership: @tz is borrowed; the returned date-time is owned by the caller.
+ *
+ * Returns: (transfer full) (nullable): the local date-time; release with
+ *   g_date_time_unref().
+ */
 static GDateTime *
 zone_datetime(GTimeZone *tz, gint64 ms)
 {
+  if (tz == NULL)
+    return NULL;
   gint64 secs = ms / 1000; /* floor, overflow-free for every gint64 */
   if (ms % 1000 < 0)
     secs--;
@@ -57,7 +98,21 @@ zone_datetime(GTimeZone *tz, gint64 ms)
   return local;
 }
 
-/* Shared immutable UTC zone, created once and never freed. */
+/**
+ * utc_tz:
+ *
+ * Shared immutable UTC zone, created once on first use and never freed.
+ *
+ * Preconditions:
+ *  - none.
+ * Postconditions:
+ *  - returns the same zone on every call (g_time_zone_new_utc() cannot fail).
+ * Thread affinity: any thread (one-time initialisation via g_once_init_enter).
+ * Ownership: (transfer none) - owned by this file for the process lifetime;
+ *   the caller must not unref it.
+ *
+ * Returns: (not nullable): the shared UTC zone.
+ */
 static GTimeZone *
 utc_tz(void)
 {
@@ -69,16 +124,47 @@ utc_tz(void)
   return (GTimeZone *)tz_once;
 }
 
-/* The zone whose wall clock labels the samples of @range: New York for the
+/**
+ * range_tz:
+ * @range: the series range.
+ *
+ * The zone whose wall clock labels the samples of @range: New York for the
  * intraday range (true UTC instants), UTC for the daily ranges (their
  * timestamps are 00:00:00 UTC of the trading date, so the UTC date IS the
- * trading date). */
+ * trading date).
+ *
+ * Preconditions:
+ *  - none; any @range value is accepted (unknown values select UTC).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (the shared zones are immutable).
+ * Ownership: (transfer none) - the zone is owned by this file; do not unref.
+ *
+ * Returns: (nullable): the shared zone; NULL only for STK_RANGE_1D when the
+ *   New York zone is unavailable (see ny_tz()).
+ */
 static GTimeZone *
 range_tz(StkRange range)
 {
   return range == STK_RANGE_1D ? ny_tz() : utc_tz();
 }
 
+/**
+ * datetime_ms:
+ * @dt: (not nullable): date-time to convert.
+ *
+ * Whole Unix seconds of @dt times 1000.
+ *
+ * Preconditions:
+ *  - @dt is non-NULL. Every GDateTime lies in the years 1..9999, so the
+ *    product is within +-2.6e14 and cannot overflow gint64.
+ * Postconditions:
+ *  - @dt is not modified or unreferenced.
+ * Thread affinity: any thread (pure).
+ * Ownership: @dt is borrowed; nothing is retained.
+ *
+ * Returns: the instant in epoch milliseconds (sub-second part dropped).
+ */
 static gint64
 datetime_ms(GDateTime *dt)
 {
@@ -89,12 +175,14 @@ datetime_ms(GDateTime *dt)
 /* Series helpers                                                           */
 /* ------------------------------------------------------------------------ */
 
+/* Documented in stk-chart-geom.h. */
 gboolean
 stk_chart_geom_is_up(const double *v, gsize n)
 {
   return n < 2 || v[n - 1] >= v[0];
 }
 
+/* Documented in stk-chart-geom.h. */
 gboolean
 stk_chart_geom_is_up_vs_close(const double *v, gsize n, double prev_close)
 {
@@ -105,6 +193,7 @@ stk_chart_geom_is_up_vs_close(const double *v, gsize n, double prev_close)
   return stk_chart_geom_is_up(v, n);
 }
 
+/* Documented in stk-chart-geom.h. */
 gboolean
 stk_chart_geom_domain(StkRange range, const double *t, gsize n, double *t0, double *t1)
 {
@@ -114,7 +203,12 @@ stk_chart_geom_domain(StkRange range, const double *t, gsize n, double *t0, doub
   if (range == STK_RANGE_1D) {
     GDate date;
     gint64 start_ms, end_ms;
-    if (stk_market_local_date((gint64)t[n - 1], &date) &&
+    /* (gint64) of a NaN, an infinity or a value of magnitude >= 2^63 is
+     * undefined: such an instant has no New York date, so it takes the
+     * first..last path below. (double)G_MAXINT64 is 2^63 itself, hence the
+     * strict bound. */
+    double last_t = t[n - 1];
+    if (fabs(last_t) < 9223372036854775808.0 && stk_market_local_date((gint64)last_t, &date) &&
         stk_market_session(&date, &start_ms, &end_ms)) {
       *t0 = (double)start_ms;
       *t1 = (double)end_ms;
@@ -126,8 +220,32 @@ stk_chart_geom_domain(StkRange range, const double *t, gsize n, double *t0, doub
   return TRUE;
 }
 
-/* Appends index @i (relative to the sampled slice) unless it is not beyond the
- * last appended one; keeps the output ascending without duplicates. */
+/**
+ * sample_emit:
+ * @w: (not nullable): the sampled slice.
+ * @i: index into @w to append.
+ * @max_out: capacity of @t and @v.
+ * @count: (inout): number of samples already appended.
+ * @last: (inout): slice index of the last appended sample; read only when
+ *   *@count > 0.
+ * @t: (out caller-allocates): receives the timestamp (as double).
+ * @v: (out caller-allocates): receives the value.
+ *
+ * Appends index @i (relative to the sampled slice) unless it is not beyond the
+ * last appended one; keeps the output ascending without duplicates.
+ *
+ * Preconditions:
+ *  - @i is a valid index of @w (every call in stk_chart_geom_sample() passes a
+ *    value below the window size); @t and @v hold @max_out entries; @count and
+ *    @last are non-NULL.
+ * Postconditions:
+ *  - appends only when *@count < @max_out, so @t and @v are never written at
+ *    an index >= @max_out; otherwise nothing changes.
+ * Thread affinity: any thread (pure).
+ * Ownership: @w is borrowed; @t, @v, @count and @last are caller-owned.
+ *
+ * Returns: void.
+ */
 static void
 sample_emit(const StkPoint *w, gsize i, gsize max_out, gsize *count, gsize *last, double *t,
             double *v)
@@ -140,6 +258,7 @@ sample_emit(const StkPoint *w, gsize i, gsize max_out, gsize *count, gsize *last
   (*count)++;
 }
 
+/* Documented in stk-chart-geom.h. */
 gsize
 stk_chart_geom_sample(StkRange range, const StkPoint *points, gsize n, gsize max_out, double *t,
                       double *v, double *t0, double *t1)
@@ -212,6 +331,7 @@ stk_chart_geom_sample(StkRange range, const StkPoint *points, gsize n, gsize max
   return count;
 }
 
+/* Documented in stk-chart-geom.h. */
 gboolean
 stk_chart_geom_y_range(const double *v, gsize n, double include, double pad_frac, double *lo,
                        double *hi)
@@ -248,6 +368,7 @@ stk_chart_geom_y_range(const double *v, gsize n, double include, double pad_frac
   return TRUE;
 }
 
+/* Documented in stk-chart-geom.h. */
 double
 stk_chart_geom_map(double x, double d0, double d1, double r0, double r1)
 {
@@ -260,6 +381,27 @@ stk_chart_geom_map(double x, double d0, double d1, double r0, double r1)
 /* Decimation                                                               */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * column_of:
+ * @t: sample timestamp, epoch ms.
+ * @t0: domain start.
+ * @span: domain length t1 - t0; not positive or NaN puts everything in column 0.
+ * @columns: number of columns.
+ *
+ * Maps @t to a column index in [0, @columns - 1].
+ *
+ * Preconditions:
+ *  - @columns >= 1 (the only caller returns early on 0), so @columns - 1 does
+ *    not wrap.
+ * Postconditions:
+ *  - the result is < @columns for every input including NaN and infinities:
+ *    the (gsize) cast is only reached for 0 < c < (double) @columns, and a
+ *    NaN @t, @t0 or @span takes one of the earlier returns.
+ * Thread affinity: any thread (pure).
+ * Ownership: none (no pointers).
+ *
+ * Returns: the column index.
+ */
 static gsize
 column_of(double t, double t0, double span, gsize columns)
 {
@@ -273,6 +415,27 @@ column_of(double t, double t0, double span, gsize columns)
   return (gsize)c;
 }
 
+/**
+ * flush_column:
+ * @imin: index of the lowest-valued sample of the finished column.
+ * @imax: index of the highest-valued sample of the finished column.
+ * @out: (out caller-allocates): receives the indices.
+ * @written: number of entries already written to @out.
+ * @out_cap: capacity of @out.
+ *
+ * Appends the smaller then the larger of @imin and @imax (once if equal) to
+ * @out, never past @out_cap.
+ *
+ * Preconditions:
+ *  - @out holds @out_cap entries; @written <= @out_cap.
+ * Postconditions:
+ *  - at most 2 entries are written, each only when @written < @out_cap, so
+ *    @out is never written beyond index @out_cap - 1.
+ * Thread affinity: any thread (pure).
+ * Ownership: @out is caller-owned and written; nothing is retained.
+ *
+ * Returns: the new number of entries written (<= @out_cap).
+ */
 static gsize
 flush_column(gsize imin, gsize imax, gsize *out, gsize written, gsize out_cap)
 {
@@ -285,6 +448,7 @@ flush_column(gsize imin, gsize imax, gsize *out, gsize written, gsize out_cap)
   return written;
 }
 
+/* Documented in stk-chart-geom.h. */
 gsize
 stk_chart_geom_decimate(const double *t, const double *v, gsize n, double t0, double t1,
                         gsize columns, gsize *out, gsize out_cap)
@@ -325,6 +489,7 @@ stk_chart_geom_decimate(const double *t, const double *v, gsize n, double t0, do
 /* Ticks                                                                    */
 /* ------------------------------------------------------------------------ */
 
+/* Documented in stk-chart-geom.h. */
 gsize
 stk_chart_geom_nice_ticks(double lo, double hi, gsize max_ticks, double min_step, double *out)
 {
@@ -397,8 +562,27 @@ stk_chart_geom_nice_ticks(double lo, double hi, gsize max_ticks, double min_step
 
 typedef enum { UNIT_HOUR, UNIT_DAY, UNIT_MONTH } TickUnit;
 
-/* TRUE if instant @ms is exactly @hour:00:00 on the New York calendar day
- * (@year, @month, @day). */
+/**
+ * is_wall_hour:
+ * @ms: instant to test, epoch ms.
+ * @year: expected New York calendar year.
+ * @month: expected New York calendar month, 1..12.
+ * @day: expected New York day of month.
+ * @hour: expected New York hour, 0..23.
+ *
+ * Tests whether @ms is exactly @hour:00:00 on the New York calendar day
+ * (@year, @month, @day).
+ *
+ * Preconditions:
+ *  - none; any @ms is accepted.
+ * Postconditions:
+ *  - FALSE when @ms is outside the years 1..9999 or the New York zone is
+ *    unavailable. No state is changed.
+ * Thread affinity: any thread (the shared zone is immutable).
+ * Ownership: none (no pointers).
+ *
+ * Returns: TRUE if @ms is that wall-clock instant, FALSE otherwise.
+ */
 static gboolean
 is_wall_hour(gint64 ms, int year, int month, int day, int hour)
 {
@@ -412,14 +596,42 @@ is_wall_hour(gint64 ms, int year, int month, int day, int hour)
   return yes;
 }
 
-/* Hour ticks: every @step hours of New York WALL-CLOCK time, i.e. at the
+/**
+ * generate_hour_ticks:
+ * @step: spacing in hours; one of 1, 2, 3, 4, 6, 12, 24 (divides 24).
+ * @t0: domain start, epoch ms.
+ * @t1: domain end, epoch ms.
+ * @max_ticks: capacity of @out.
+ * @out: (out caller-allocates): receives the ticks.
+ *
+ * Hour ticks: every @step hours of New York WALL-CLOCK time, i.e. at the
  * local hours 0, step, 2*step, ... of every local day, so that DST changes
  * cannot shift the alignment (every allowed step divides 24). Local times
  * that do not exist (spring-forward gap) are skipped. A local hour that
  * occurs twice (fall-back) yields ONE tick: the earlier (daylight-time)
  * instant if it lies in [t0, t1], otherwise the later one if that does.
  * Writes at most @max_ticks entries and returns the count, or max_ticks + 1
- * as soon as there would be more. */
+ * as soon as there would be more.
+ *
+ * Preconditions:
+ *  - @step is one of the values listed (so 24 / @step >= 1 and no division by
+ *    zero; the only caller takes it from its hour_steps table); @out holds
+ *    @max_ticks entries.
+ * Postconditions:
+ *  - returns 0 (nothing written) when the New York zone is unavailable or
+ *    @t0 is outside the years 1..9999. Every GDateTime created here is
+ *    unreferenced before returning; the ticks are ascending.
+ *  - termination: the slot counter grows by 1 per pass and the wall time of
+ *    slot k is non-decreasing in k, so the loop stops at the first tick
+ *    > @t1, or when GLib returns NULL for a day beyond year 9999 (so
+ *    slot / (24 / @step) stays far below INT_MAX, and the (int) cast of the
+ *    day offset is lossless), or after @max_ticks + 1 emitted ticks. The hour
+ *    (slot % (24 / @step)) * @step is below 24.
+ * Thread affinity: any thread (the shared zone is immutable).
+ * Ownership: @out is caller-owned and written; nothing is retained.
+ *
+ * Returns: number of ticks written, or @max_ticks + 1 if there would be more.
+ */
 static gsize
 generate_hour_ticks(int step, gint64 t0, gint64 t1, gsize max_ticks, gint64 *out)
 {
@@ -478,10 +690,39 @@ generate_hour_ticks(int step, gint64 t0, gint64 t1, gsize max_ticks, gint64 *out
   return n;
 }
 
-/* Day / month ticks in @tz at local midnights every @step days (counted from
- * the first midnight >= t0) or on the first of every @step-th month. Writes
+/**
+ * generate_calendar_ticks:
+ * @tz: (not nullable): zone whose local midnights are the ticks (the UTC zone).
+ * @unit: UNIT_DAY (every @step days) or UNIT_MONTH (first of every @step-th
+ *   month).
+ * @step: spacing in days or months; at least 1.
+ * @t0: domain start, epoch ms.
+ * @t1: domain end, epoch ms.
+ * @max_ticks: capacity of @out.
+ * @out: (out caller-allocates): receives the ticks.
+ *
+ * Day / month ticks in @tz at local midnights every @step days (counted from
+ * the first midnight >= @t0) or on the first of every @step-th month. Writes
  * at most @max_ticks entries; returns the count, or max_ticks + 1 as soon as
- * there would be more (so huge domains terminate quickly). */
+ * there would be more (so huge domains terminate quickly).
+ *
+ * Preconditions:
+ *  - @tz is non-NULL; @step >= 1; @out holds @max_ticks entries (the only
+ *    caller passes STK_CHART_GEOM_MAX_TICKS at most).
+ * Postconditions:
+ *  - returns 0 (nothing written) when @t0 is outside the years 1..9999. Every
+ *    GDateTime created here is unreferenced before returning; the ticks are
+ *    ascending and inside [@t0, @t1].
+ *  - termination: the search for the first midnight >= @t0 starts at the
+ *    midnight of @t0's own date (<= @t0) and so advances at most once; the
+ *    emit loop advances by >= 1 day / month per pass, stops at the first tick
+ *    > @t1 or when GLib returns NULL beyond year 9999, and returns after at
+ *    most @max_ticks + 1 passes.
+ * Thread affinity: any thread (the shared zone is immutable).
+ * Ownership: @tz is borrowed; @out is caller-owned and written.
+ *
+ * Returns: number of ticks written, or @max_ticks + 1 if there would be more.
+ */
 static gsize
 generate_calendar_ticks(GTimeZone *tz, TickUnit unit, int step, gint64 t0, gint64 t1,
                         gsize max_ticks, gint64 *out)
@@ -519,6 +760,30 @@ generate_calendar_ticks(GTimeZone *tz, TickUnit unit, int step, gint64 t0, gint6
   return n;
 }
 
+/**
+ * generate_ticks:
+ * @unit: tick unit; selects the generator.
+ * @step: spacing in units of @unit.
+ * @t0: domain start, epoch ms.
+ * @t1: domain end, epoch ms.
+ * @max_ticks: capacity of @out and tick limit.
+ * @out: (out caller-allocates): receives the ticks.
+ *
+ * Dispatches to generate_hour_ticks() (UNIT_HOUR, New York) or
+ * generate_calendar_ticks() (UNIT_DAY / UNIT_MONTH, UTC).
+ *
+ * Preconditions:
+ *  - those of the generator selected: @step comes from the step tables of
+ *    stk_chart_geom_time_ticks(), @max_ticks <= STK_CHART_GEOM_MAX_TICKS and
+ *    @out holds @max_ticks entries.
+ * Postconditions:
+ *  - as the generator selected: the tick count, or @max_ticks + 1 when more
+ *    ticks exist.
+ * Thread affinity: any thread (shared zones are immutable).
+ * Ownership: @out is caller-owned and written; nothing is retained.
+ *
+ * Returns: number of ticks written, or @max_ticks + 1 if there would be more.
+ */
 static gsize
 generate_ticks(TickUnit unit, int step, gint64 t0, gint64 t1, gsize max_ticks, gint64 *out)
 {
@@ -527,6 +792,7 @@ generate_ticks(TickUnit unit, int step, gint64 t0, gint64 t1, gsize max_ticks, g
   return generate_calendar_ticks(utc_tz(), unit, step, t0, t1, max_ticks, out);
 }
 
+/* Documented in stk-chart-geom.h. */
 gsize
 stk_chart_geom_time_ticks(StkRange range, gint64 t0_ms, gint64 t1_ms, gsize max_ticks,
                           gint64 *out)
@@ -575,6 +841,7 @@ stk_chart_geom_time_ticks(StkRange range, gint64 t0_ms, gint64 t1_ms, gsize max_
   return 0;
 }
 
+/* Documented in stk-chart-geom.h. */
 gboolean
 stk_chart_geom_nearest(const double *t, gsize n, double target, gsize *idx)
 {
@@ -604,12 +871,31 @@ stk_chart_geom_nearest(const double *t, gsize n, double target, gsize *idx)
 /* Formatting                                                               */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * put_dash:
+ * @buf: (out caller-allocates): output buffer.
+ * @len: size of @buf in bytes.
+ *
+ * Writes the em dash placeholder "—" into @buf.
+ *
+ * Preconditions:
+ *  - @buf is writable for @len bytes and @len > 0 (every caller returns early
+ *    on len == 0).
+ * Postconditions:
+ *  - @buf holds the NUL-terminated dash, truncated by g_strlcpy() to @len - 1
+ *    bytes if @len is too small (a partial UTF-8 sequence is then possible).
+ * Thread affinity: any thread (pure).
+ * Ownership: @buf is caller-owned and written; nothing is retained.
+ *
+ * Returns: void.
+ */
 static void
 put_dash(char *buf, gsize len)
 {
   g_strlcpy(buf, EM_DASH, len);
 }
 
+/* Documented in stk-chart-geom.h. */
 void
 stk_chart_geom_format_price(double v, char *buf, gsize len)
 {
@@ -620,6 +906,12 @@ stk_chart_geom_format_price(double v, char *buf, gsize len)
     return;
   }
 
+  /* Bound proof: |v| < 1e12 here, so "%.2f" yields at most '-' + 13 digits
+   * (rounding may carry 999999999999.995 up to 1000000000000.00) + '.' + 2
+   * decimals = 17 bytes + NUL, well inside raw[40]; g_ascii_formatd()
+   * NUL-terminates what it writes, so the strchr/strlen/strspn calls below run
+   * on a string created by GLib in this function. out[64] receives at most
+   * 1 + 13 + 4 commas + 3 + NUL = 22 bytes. */
   char raw[40];
   g_ascii_formatd(raw, sizeof raw, "%.2f", v);
 
@@ -653,9 +945,35 @@ stk_chart_geom_format_price(double v, char *buf, gsize len)
   g_strlcpy(buf, out, len);
 }
 
+/* Index proof for month_names[g_date_time_get_month(dt) - 1] in the two
+ * format functions: g_date_time_get_month() is documented to return 1..12 for
+ * every valid GDateTime, and every GDateTime used there is non-NULL (checked
+ * by the callers), so the index lies in 0..11. */
 static const char *const month_names[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
+/**
+ * format_clock:
+ * @dt: (not nullable): local date-time whose hour and minute are printed.
+ * @buf: (out caller-allocates): output buffer.
+ * @len: size of @buf in bytes.
+ * @always_minutes: TRUE to print ":MM" even when the minute is 0.
+ *
+ * Writes the 12-hour clock text "H:MM AM" / "H AM" (English, locale
+ * independent) of @dt.
+ *
+ * Preconditions:
+ *  - @dt is non-NULL; @buf is writable for @len bytes and @len > 0 (both
+ *    callers return early on len == 0).
+ * Postconditions:
+ *  - @buf holds a NUL-terminated string, truncated by g_snprintf() to @len - 1
+ *    bytes if @len is too small; @dt is not modified or unreferenced.
+ * Thread affinity: any thread (pure).
+ * Ownership: @dt is borrowed; @buf is caller-owned and written; nothing is
+ *   retained.
+ *
+ * Returns: void.
+ */
 static void
 format_clock(GDateTime *dt, char *buf, gsize len, gboolean always_minutes)
 {
@@ -669,6 +987,7 @@ format_clock(GDateTime *dt, char *buf, gsize len, gboolean always_minutes)
     g_snprintf(buf, len, "%d %s", h12, ampm);
 }
 
+/* Documented in stk-chart-geom.h. */
 void
 stk_chart_geom_format_tick(StkRange range, gint64 ms, char *buf, gsize len)
 {
@@ -698,6 +1017,7 @@ stk_chart_geom_format_tick(StkRange range, gint64 ms, char *buf, gsize len)
   g_date_time_unref(dt);
 }
 
+/* Documented in stk-chart-geom.h. */
 void
 stk_chart_geom_format_hover(StkRange range, gint64 ms, char *buf, gsize len)
 {

@@ -47,8 +47,20 @@ G_BEGIN_DECLS
 
 /**
  * stk_chart_geom_is_up:
- * @v: (nullable): @n values; may be NULL only when @n is 0.
+ * @v: (nullable): @n values; may be NULL only when @n is less than 2.
  * @n: number of values.
+ *
+ * Direction of a series: last value against first value.
+ *
+ * Preconditions:
+ *  - when @n >= 2, @v is non-NULL and points to @n readable doubles (a NULL
+ *    @v with @n >= 2 is dereferenced; it is a caller error and is not
+ *    detected).
+ * Postconditions:
+ *  - no state is changed; @v is only read (v[0] and v[n - 1]). A NaN end value
+ *    makes the comparison false (reported as "down").
+ * Thread affinity: any thread (pure).
+ * Ownership: @v is borrowed for the call; nothing is retained.
  *
  * Returns: TRUE if the last value is >= the first value. A series with fewer
  *   than two values counts as up.
@@ -62,11 +74,22 @@ gboolean stk_chart_geom_is_up(const double *v, gsize n);
  * @prev_close: the previous close, or a non-finite value (NaN, +inf, -inf)
  *   when there is none.
  *
- * Direction of a 1D chart as the detail header and list row show it. When
+ * Direction of the chart widget's colour for a chart that may carry a previous close. When
  * @prev_close is finite, returns TRUE if the last value is >= @prev_close
  * (equality counts as up; a single value is compared too); n == 0 returns
  * TRUE. When @prev_close is not finite, returns exactly
  * stk_chart_geom_is_up(@v, @n) (last value >= first value).
+ *
+ * Preconditions:
+ *  - when @n >= 1, @v is non-NULL and points to @n readable doubles (a NULL
+ *    @v with @n >= 1 is dereferenced; it is a caller error and is not
+ *    detected).
+ * Postconditions:
+ *  - no state is changed; @v is only read.
+ * Thread affinity: any thread (pure).
+ * Ownership: @v is borrowed for the call; nothing is retained.
+ *
+ * Returns: TRUE if the series is up as described above, FALSE otherwise.
  */
 gboolean stk_chart_geom_is_up_vs_close(const double *v, gsize n, double prev_close);
 
@@ -85,9 +108,27 @@ gboolean stk_chart_geom_is_up_vs_close(const double *v, gsize n, double prev_clo
  * supported years) and for every other range, the domain is
  * [first, last] of @t.
  *
- * Returns: FALSE (outputs untouched) when @n is 0; otherwise TRUE with
- *   *t0 <= *t1 (equal when the first..last rule applies to a single
- *   timestamp).
+ * Preconditions:
+ *  - when @n >= 1, @t is non-NULL and points to @n readable doubles; @t0 and
+ *    @t1 are non-NULL and writable (violations are dereferenced and not
+ *    detected).
+ *  - only for the ordering promise under Returns: @t is ascending and free of NaN. Other
+ *    input is accepted and memory-safe but then *t0 <= *t1 is not guaranteed.
+ * Postconditions:
+ *  - on TRUE both outputs are written; on FALSE they are untouched.
+ *  - a last timestamp that is NaN, infinite or of magnitude >= 2^63 has no New
+ *    York date: it is never cast to gint64 (that cast is undefined) and takes
+ *    the [first, last] path, exactly as an out-of-calendar date does.
+ *    Results for every other input are unchanged.
+ *  - if the New York time zone is unavailable the 1D case also takes the
+ *    [first, last] path.
+ * Thread affinity: any thread (pure; the shared zone is immutable).
+ * Ownership: @t is borrowed for the call; @t0 and @t1 are caller-owned.
+ *
+ * Returns: FALSE (outputs untouched) when @n is 0; otherwise TRUE. For ascending,
+ *   NaN-free @t, *t0 <= *t1 (equal when the first..last rule applies to a single
+ *   timestamp); for other input (unordered, NaN or infinite timestamps) the order of
+ *   *t0 and *t1 is not guaranteed.
  */
 gboolean stk_chart_geom_domain(StkRange range, const double *t, gsize n, double *t0, double *t1);
 
@@ -111,8 +152,26 @@ gboolean stk_chart_geom_domain(StkRange range, const double *t, gsize n, double 
  * direction and the global minimum/maximum survive (a single pass; memory
  * is O(@max_out) regardless of @n). Output is ascending without duplicates.
  *
+ * Preconditions:
+ *  - when @n >= 1 and @max_out >= 4: @points points to @n readable samples
+ *    and @t, @v, @t0, @t1 are non-NULL and writable (@t and @v for @max_out
+ *    doubles each).
+ *  - @n is below 2^32.
+ *  - non-ascending or NaN timestamps are tolerated memory-safely (the binary
+ *    searches keep their indices inside [0, @n]) but give an unspecified
+ *    window.
+ * Postconditions:
+ *  - never writes beyond @max_out entries of @t and @v; reads only
+ *    @points[0 .. @n - 1].
+ *  - when the result is 0, @t, @v, @t0 and @t1 are untouched; otherwise @t0
+ *    and @t1 are written.
+ * Thread affinity: any thread (pure; the shared zone is immutable).
+ * Ownership: @points is borrowed for the call; @t, @v, @t0 and @t1 are
+ *   caller-owned; nothing is retained.
+ *
  * Returns: number of samples written (<= @max_out), 0 (outputs untouched)
- *   when @n is 0 or no sample lies inside the domain.
+ *   when @n is 0, @points is NULL, @max_out < 4 or no sample lies inside the
+ *   domain.
  */
 gsize stk_chart_geom_sample(StkRange range, const StkPoint *points, gsize n, gsize max_out,
                             double *t, double *v, double *t0, double *t1);
@@ -132,6 +191,15 @@ gsize stk_chart_geom_sample(StkRange range, const StkPoint *points, gsize n, gsi
  * each side by @pad_frac * (max - min). A flat range (max == min) is instead
  * widened by max(1% of |value|, 0.01) on each side so that hi > lo always.
  * Non-finite entries of @v are ignored.
+ *
+ * Preconditions:
+ *  - when @n >= 1, @v is non-NULL and points to @n readable doubles; @lo and
+ *    @hi are non-NULL and writable (violations are dereferenced and not
+ *    detected).
+ * Postconditions:
+ *  - on TRUE both outputs are written; on FALSE they are untouched.
+ * Thread affinity: any thread (pure).
+ * Ownership: @v is borrowed for the call; @lo and @hi are caller-owned.
  *
  * Returns: FALSE (outputs untouched) if there is no finite value at all or
  *   if the padded bounds or their difference overflow double (|values| near
@@ -153,20 +221,32 @@ gboolean stk_chart_geom_y_range(const double *v, gsize n, double include, double
  * exceed @r1 (flipped y axis); swapping domain and image gives the inverse
  * map. A degenerate domain (@d0 == @d1) maps everything to the midpoint of
  * the image.
+ *
+ * Preconditions:
+ *  - none; the function is pure arithmetic and reads or writes no memory. The behaviour
+ *    described above holds for finite arguments whose intermediate results do not overflow.
+ *    For NaN, infinite or overflowing arguments the returned value is unspecified (it may be
+ *    NaN or infinite).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: none (no pointers).
+ *
+ * Returns: the mapped value.
  */
 double stk_chart_geom_map(double x, double d0, double d1, double r0, double r1);
 
 /**
  * stk_chart_geom_decimate:
  * @t: (nullable): @n ascending timestamps; may be NULL only when @n is 0.
- * @v: (nullable): @n values, parallel to @t.
+ * @v: (nullable): @n values, parallel to @t; may be NULL only when @n is 0.
  * @n: number of samples.
  * @t0: x-axis domain start.
  * @t1: x-axis domain end.
  * @columns: number of pixel columns the domain is drawn on (>= 1; 0 gives 0
  *   output).
  * @out: (out caller-allocates): indices of the kept samples.
- * @out_cap: capacity of @out. 2 * @columns always suffices.
+ * @out_cap: capacity of @out. For ascending @t, 2 * @columns always suffices.
  *
  * Min/max decimation: the domain is cut into @columns equal columns (sample
  * time -> floor((t - t0) / (t1 - t0) * columns), clamped to [0, columns-1];
@@ -177,6 +257,19 @@ double stk_chart_geom_map(double x, double d0, double d1, double r0, double r1);
  * skipped. Output indices are ascending (original order). Columns are
  * processed in input order, so ascending @t is required for the 2-per-column
  * bound; output is truncated at @out_cap regardless.
+ *
+ * Preconditions:
+ *  - when @n >= 1 and @columns >= 1: @t and @v are non-NULL and point to @n
+ *    readable doubles each; @out is non-NULL when @out_cap > 0 and holds
+ *    @out_cap entries.
+ * Postconditions:
+ *  - never writes beyond @out_cap entries of @out; every written index is
+ *    below @n.
+ *  - a NaN @t[i] or non-ascending @t is memory-safe (the column index is
+ *    always below @columns) but may emit more or fewer samples per column
+ *    than the 2-per-column bound.
+ * Thread affinity: any thread (pure).
+ * Ownership: @t and @v are borrowed for the call; @out is caller-owned.
  *
  * Returns: number of indices written to @out.
  */
@@ -207,6 +300,17 @@ gsize stk_chart_geom_decimate(const double *t, const double *v, gsize n, double 
  * skipped if it is not a normal positive double, is below @min_step, if
  * |@lo| / step or |@hi| / step exceeds 2^52, or if its ticks would violate
  * the above.
+ *
+ * Preconditions:
+ *  - @out is non-NULL and writable for STK_CHART_GEOM_MAX_TICKS doubles
+ *    whenever the call can succeed (the function writes at most that many,
+ *    and only via a final copy after all checks passed).
+ * Postconditions:
+ *  - see above: the count written is the return value; @out is untouched when
+ *    0 is returned. The only float-to-integer cast, (gsize)count, is reached
+ *    only with 1 <= count <= @max_ticks <= STK_CHART_GEOM_MAX_TICKS.
+ * Thread affinity: any thread (pure).
+ * Ownership: @out is caller-owned; nothing is retained.
  *
  * Returns: number of ticks written. 0 if @lo/@hi are not finite, @hi <= @lo,
  *   @hi - @lo overflows, @max_ticks is 0, (@hi - @lo) / @max_ticks (after
@@ -241,8 +345,24 @@ gsize stk_chart_geom_nice_ticks(double lo, double hi, gsize max_ticks, double mi
  * Writes ascending tick instants inside [@t0_ms, @t1_ms], using the finest
  * spacing from the lists above that gives at most @max_ticks.
  *
+ * Preconditions:
+ *  - @out is non-NULL and writable for STK_CHART_GEOM_MAX_TICKS gint64 values
+ *    whenever the call can succeed (at most min(@max_ticks,
+ *    STK_CHART_GEOM_MAX_TICKS) are written).
+ * Postconditions:
+ *  - @out is written only on a non-zero return, and then only with the
+ *    returned number of entries. Every GDateTime created internally is
+ *    released. Termination is bounded: each generator stops after at most
+ *    @max_ticks + 1 emitted ticks, at the first instant past @t1_ms, or at
+ *    year 9999.
+ *  - if the New York time zone is unavailable, STK_RANGE_1D returns 0 (this
+ *    replaces a former g_assert()).
+ * Thread affinity: any thread (pure; the shared zones are immutable).
+ * Ownership: @out is caller-owned; nothing is retained.
+ *
  * Returns: number of ticks; 0 if the domain is empty or inverted, @max_ticks
- *   is 0, the domain lies outside the representable date range, the domain
+ *   is 0, the domain lies outside the representable date range (see
+ *   stk_chart_geom_format_tick()),
  *   contains no tick instant at all, or even the coarsest spacing gives more
  *   than @max_ticks.
  */
@@ -259,6 +379,17 @@ gsize stk_chart_geom_time_ticks(StkRange range, gint64 t0_ms, gint64 t1_ms, gsiz
  * Binary search; on an exact tie between two neighbours the earlier one wins.
  * A target before the first / after the last timestamp yields index 0 / n-1.
  *
+ * Preconditions:
+ *  - when @n >= 1, @t is non-NULL and points to @n readable doubles and @idx
+ *    is non-NULL and writable (violations are dereferenced and not detected).
+ *  - @t is ascending and free of NaN. With NaN or unordered entries the
+ *    search stays memory-safe (the written index is always < @n) but the
+ *    chosen index is unspecified.
+ * Postconditions:
+ *  - on TRUE *@idx < @n; on FALSE @idx is untouched.
+ * Thread affinity: any thread (pure).
+ * Ownership: @t is borrowed for the call; @idx is caller-owned.
+ *
  * Returns: FALSE (@idx untouched) if @n is 0 or @target is NaN.
  */
 gboolean stk_chart_geom_nearest(const double *t, gsize n, double target, gsize *idx);
@@ -273,6 +404,20 @@ gboolean stk_chart_geom_nearest(const double *t, gsize n, double target, gsize *
  * leading '-' for negative values ("-0.00" is never produced). Non-finite
  * values or |v| >= 1e12 produce an em dash. Output is always NUL-terminated
  * (truncated if @len is too small); @len 0 writes nothing.
+ *
+ * Preconditions:
+ *  - when @len > 0, @buf is non-NULL and writable for @len bytes.
+ * Postconditions:
+ *  - for finite |@v| < 1e12 the intermediate text is at most 18 bytes
+ *    including the NUL (raw[40]) and the grouped text at most 22 (out[64]), so
+ *    the internal buffers cannot overflow; a larger magnitude or a
+ *    non-finite value is replaced by the em dash before any formatting.
+ *  - @buf is NUL-terminated whenever @len > 0 (truncated to @len - 1 bytes if
+ *    needed; a truncated em dash may end in a partial UTF-8 sequence).
+ * Thread affinity: any thread (pure).
+ * Ownership: @buf is caller-owned and written; nothing is retained.
+ *
+ * Returns: void.
  */
 void stk_chart_geom_format_price(double v, char *buf, gsize len);
 
@@ -287,9 +432,24 @@ void stk_chart_geom_format_price(double v, char *buf, gsize len);
  * @buf: (out caller-allocates): output buffer.
  * @len: size of @buf; STK_CHART_GEOM_LABEL_LEN always suffices.
  *
- * Axis-label text. Output is always NUL-terminated; an instant outside the
- * representable date range (years 1-9999, i.e. before 0001-01-01T00:00:00Z
- * or after 9999-12-31T23:59:59.999Z) produces an em dash.
+ * Axis-label text. Output is always NUL-terminated; an instant whose date-time in the label's
+ * zone (UTC for the daily ranges, America/New_York for STK_RANGE_1D) lies outside the years
+ * 1-9999 produces an em dash: for the daily ranges that is before 0001-01-01T00:00:00Z or
+ * after 9999-12-31T23:59:59.999Z; for 1D the lower limit is the same wall-clock time in New
+ * York, i.e. a few hours after 0001-01-01T00:00:00Z.
+ *
+ * Preconditions:
+ *  - when @len > 0, @buf is non-NULL and writable for @len bytes.
+ * Postconditions:
+ *  - @len 0 writes nothing; otherwise @buf is NUL-terminated (truncated to
+ *    @len - 1 bytes if needed). The month index into the name table is
+ *    always 0..11 (GLib months are 1..12).
+ *  - for STK_RANGE_1D with an unavailable New York time zone the em dash is
+ *    written (this replaces a former g_assert()).
+ * Thread affinity: any thread (pure; the shared zones are immutable).
+ * Ownership: @buf is caller-owned and written; nothing is retained.
+ *
+ * Returns: void.
  */
 void stk_chart_geom_format_tick(StkRange range, gint64 ms, char *buf, gsize len);
 
@@ -304,6 +464,18 @@ void stk_chart_geom_format_tick(StkRange range, gint64 ms, char *buf, gsize len)
  *
  * Tooltip text for the sample under the pointer. Same termination and
  * out-of-range rules as stk_chart_geom_format_tick().
+ *
+ * Preconditions:
+ *  - when @len > 0, @buf is non-NULL and writable for @len bytes.
+ * Postconditions:
+ *  - as stk_chart_geom_format_tick(): @len 0 writes nothing; otherwise @buf is
+ *    NUL-terminated; an out-of-range instant, or STK_RANGE_1D with an
+ *    unavailable New York time zone, gives the em dash (the latter replaces a
+ *    former g_assert()).
+ * Thread affinity: any thread (pure; the shared zones are immutable).
+ * Ownership: @buf is caller-owned and written; nothing is retained.
+ *
+ * Returns: void.
  */
 void stk_chart_geom_format_hover(StkRange range, gint64 ms, char *buf, gsize len);
 

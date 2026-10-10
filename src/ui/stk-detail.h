@@ -40,6 +40,13 @@
 
 G_BEGIN_DECLS
 
+/*
+ * G_DECLARE_FINAL_TYPE() below declares the types StkDetail and
+ * StkDetailClass, stk_detail_get_type(), the inline cast function STK_DETAIL()
+ * and the inline type-check function STK_IS_DETAIL(), and the g_autoptr()
+ * cleanup for StkDetail. STK_TYPE_DETAIL is defined here. The type itself is
+ * defined by G_DEFINE_FINAL_TYPE() in stk-detail.c.
+ */
 #define STK_TYPE_DETAIL (stk_detail_get_type())
 G_DECLARE_FINAL_TYPE(StkDetail, stk_detail, STK, DETAIL, GtkBox)
 
@@ -56,6 +63,15 @@ G_DECLARE_FINAL_TYPE(StkDetail, stk_detail, STK, DETAIL, GtkBox)
 /**
  * stk_detail_new:
  *
+ * Preconditions:
+ *  - GTK is initialised (a display is available) and the call is made on the
+ *    main thread.
+ * Postconditions:
+ *  - the pane shows the placeholder, has no item, range STK_RANGE_1D and is
+ *    not offline.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides the returned widget, which is floating).
+ *
  * Returns: (transfer floating): a pane without item (placeholder shown), range
  *   1D, not offline.
  */
@@ -63,18 +79,38 @@ GtkWidget *stk_detail_new(void);
 
 /**
  * stk_detail_set_item:
- * @self: the pane.
+ * @self: (not nullable): the pane; must satisfy STK_IS_DETAIL().
  * @item: (nullable): the item to show, or NULL for the placeholder. A
  *   reference is held until another item is set or the pane is disposed.
  *
  * Renders @item completely and follows its signals. A fund item at range 1D
  * switches the range to 1M (silently, see range-changed).
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_DETAIL() and is not disposed (dispose clears the
+ *    range buttons); @item is NULL or satisfies STK_IS_ROW_ITEM() (else:
+ *    critical, nothing changed).
+ * Postconditions:
+ *  - nothing happens when @item is the item already shown. Otherwise the
+ *    previous item (if any) is unreferenced and its handlers disconnected; the
+ *    pane holds one reference on @item (if non-NULL), follows its "changed"
+ *    and "detail-changed" signals, and shows its texts, badge and chart. For
+ *    NULL the placeholder is shown and the chart is cleared.
+ * Thread affinity: main thread only.
+ * Ownership: @item stays with the caller (the pane takes its own reference).
  */
 void stk_detail_set_item(StkDetail *self, StkRowItem *item);
 
 /**
  * stk_detail_get_range:
- * @self: the pane.
+ * @self: (not nullable): the pane; must satisfy STK_IS_DETAIL().
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_DETAIL() (else: critical, STK_RANGE_1D returned).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
  *
  * Returns: the selected range (always valid for the current item's kind).
  */
@@ -82,11 +118,21 @@ StkRange stk_detail_get_range(StkDetail *self);
 
 /**
  * stk_detail_set_offline:
- * @self: the pane.
- * @offline: whether the network is unavailable.
+ * @self: (not nullable): the pane; must satisfy STK_IS_DETAIL().
+ * @offline: whether the network is unavailable (any non-zero value counts as
+ *   TRUE).
  *
  * Shows or hides the "Offline" badge (it takes precedence over "Stale") and
  * marks the chart stale while offline. Does nothing when unchanged.
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_DETAIL() (else: critical, nothing changed) and is
+ *    not disposed.
+ * Postconditions:
+ *  - the offline flag is @offline; the badge and the chart's stale marker
+ *    were refreshed iff it changed.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
  */
 void stk_detail_set_offline(StkDetail *self, gboolean offline);
 

@@ -14,7 +14,7 @@
  *    The kind filter and the substring filter are applied by
  *    stk_catalog_filter(); the category filter keeps only entries whose
  *    category equals the selected one exactly (the drop-down lists every
- *    non-empty category of the catalog once, in strcmp order). The filter
+ *    non-empty category of the catalog once, in byte order). The filter
  *    entry is applied on every edit (no debounce, no I/O); surrounding ASCII
  *    whitespace of its text is ignored. It accepts at most
  *    STK_PICKER_MAX_QUERY_CHARS characters.
@@ -124,12 +124,12 @@ G_DECLARE_FINAL_TYPE(StkPicker, stk_picker, STK, PICKER, GtkWindow)
 
 /**
  * stk_picker_new:
- * @catalog: non-NULL catalog. BORROWED: it is not copied or reference
+ * @catalog: (not nullable): non-NULL catalog. BORROWED: it is not copied or reference
  *   counted, so it MUST stay valid until the picker is disposed (destroyed
  *   and unreferenced). The picker only reads it.
- * @watchlist: non-NULL watchlist; a reference is taken and released on
+ * @watchlist: (not nullable): non-NULL watchlist; a reference is taken and released on
  *   dispose. Main-thread only; the picker edits it through the watchlist API.
- * @provider: non-NULL StkProvider; a reference is taken and released on
+ * @provider: (not nullable): non-NULL StkProvider; a reference is taken and released on
  *   dispose. Only search_async()/search_finish() are used.
  *
  * Creates the picker window (not shown; call gtk_window_present(), and
@@ -137,6 +137,26 @@ G_DECLARE_FINAL_TYPE(StkPicker, stk_picker, STK, PICKER, GtkWindow)
  * the window is owned by GTK's list of toplevels until gtk_window_destroy();
  * the caller does not own a reference and must not unref it. Needs an
  * initialised GTK with a display. Must be called from the main thread.
+ *
+ * Preconditions:
+ *  - GTK is initialised with a display; the call is made on the main thread.
+ *  - @catalog is a live StkCatalog that is neither freed nor modified until the picker is
+ *    disposed; every entry symbol passes stk_symbol_is_valid() (the catalog constructors
+ *    guarantee it) and every entry name and category is non-NULL.
+ *  - @watchlist satisfies STK_IS_WATCHLIST() and @provider satisfies STK_IS_PROVIDER().
+ * Postconditions:
+ *  - on success the picker holds one reference each on @watchlist and @provider, is
+ *    connected to the watchlist's "changed" signal (disconnected at dispose), and lists the
+ *    catalog entries (no filter active); one item per catalog entry is created, with the
+ *    name and category made valid UTF-8, control characters replaced by spaces and each cut
+ *    to STK_WATCHLIST_MAX_NAME_BYTES bytes; the category drop-down holds "All categories"
+ *    and every distinct non-empty category in byte order.
+ *  - on failure (a NULL or wrongly typed argument) a critical is logged, nothing is
+ *    allocated and NULL is returned.
+ * Thread affinity: main thread only.
+ * Ownership: @catalog is borrowed (not copied, not referenced); @watchlist and @provider
+ *   are shared (the picker takes its own reference, the caller keeps its own); the returned
+ *   window is owned by GTK's list of toplevels, not by the caller.
  *
  * Returns: (transfer none): the new window, or NULL (with a critical) if
  *   an argument is NULL or of the wrong type.

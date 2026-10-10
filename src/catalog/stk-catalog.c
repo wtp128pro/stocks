@@ -12,8 +12,11 @@
 #define CATALOG_RESOURCE_FIDELITY "/io/github/wtp128pro/Stocks/catalog/fidelity_catalog.json"
 #define CATALOG_RESOURCE_INDICES "/io/github/wtp128pro/Stocks/catalog/market_indices.json"
 #define CATALOG_VERSION 1
-/* STK symbols are at most 15 bytes (stk_symbol_is_valid). */
-#define SYMBOL_BUF 16
+/* STK symbols are at most 15 bytes (stk_symbol_is_valid); a buffer holding one needs the NUL too. */
+#define SYMBOL_MAX_LEN 15
+#define SYMBOL_BUF (SYMBOL_MAX_LEN + 1)
+/* Upper bound for memchr() NUL scans of NUL-terminated text of no documented cap (no object is larger). */
+#define TEXT_SCAN_MAX ((gsize)G_MAXSSIZE)
 
 struct _StkCatalog {
   StkCatalogEntry *entries; /* sorted by symbol, strictly ascending */
@@ -21,13 +24,49 @@ struct _StkCatalog {
   GStringChunk *strings; /* owns every string referenced by entries */
 };
 
+/**
+ * entry_cmp:
+ * @a: (not nullable): pointer to a #StkCatalogEntry.
+ * @b: (not nullable): pointer to a #StkCatalogEntry.
+ *
+ * qsort() comparator: orders entries by symbol in byte order (the order of g_strcmp0()).
+ *
+ * Preconditions:
+ *  - @a and @b point to entries whose symbol is a non-NULL NUL-terminated string. The only
+ *    caller (catalog_from_documents()) sorts entries filled by parse_document(), whose
+ *    symbol comes from g_string_chunk_insert().
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: nothing is retained.
+ *
+ * Returns: negative, zero or positive as the symbol of @a sorts before, equal to or after the
+ *   symbol of @b.
+ */
 static int
 entry_cmp(const void *a, const void *b)
 {
-  return strcmp(((const StkCatalogEntry *)a)->symbol, ((const StkCatalogEntry *)b)->symbol);
+  return g_strcmp0(((const StkCatalogEntry *)a)->symbol, ((const StkCatalogEntry *)b)->symbol);
 }
 
-/* Member @key of @obj if it is a JSON string, else NULL. */
+/**
+ * member_string:
+ * @obj: (not nullable): JSON object to read.
+ * @key: (not nullable): member name.
+ *
+ * Member @key of @obj if it is a JSON string, else NULL.
+ *
+ * Preconditions:
+ *  - @obj is a valid #JsonObject and @key a NUL-terminated string (all callers pass literals
+ *    and an object obtained from a parsed document).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (touches only @obj; the caller must not use @obj concurrently).
+ * Ownership: nothing is retained; the returned string is owned by @obj.
+ *
+ * Returns: (transfer none) (nullable): the member's string, or NULL if the member is missing or
+ *   not a string.
+ */
 static const char *
 member_string(JsonObject *obj, const char *key)
 {
@@ -38,6 +77,23 @@ member_string(JsonObject *obj, const char *key)
   return json_node_get_string(node);
 }
 
+/**
+ * is_canonical_symbol:
+ * @symbol: (not nullable): candidate ticker.
+ *
+ * Whether @symbol passes stk_symbol_is_valid() and contains no ASCII lower-case letter.
+ *
+ * Preconditions:
+ *  - @symbol is a non-NULL NUL-terminated string (the only caller passes a member string of a
+ *    parsed JSON document, after a NULL check).
+ * Postconditions:
+ *  - no state is changed. The scan loop only runs once stk_symbol_is_valid() proved 1..15 bytes
+ *    followed by a NUL, so it stays inside that string.
+ * Thread affinity: any thread (pure).
+ * Ownership: nothing is retained.
+ *
+ * Returns: TRUE if @symbol is a valid, already upper-case symbol, FALSE otherwise.
+ */
 static gboolean
 is_canonical_symbol(const char *symbol)
 {
@@ -49,9 +105,27 @@ is_canonical_symbol(const char *symbol)
   return TRUE;
 }
 
-/*
- * Builds the folded search blob "symbol\0name\0category\0" for one entry in the
- * catalog's string arena. @scratch is reused between calls.
+/**
+ * make_search_blob:
+ * @strings: (not nullable): the catalog's string arena that receives the blob.
+ * @scratch: (not nullable): work buffer, reused between calls; its content is overwritten.
+ * @symbol: (not nullable): entry symbol.
+ * @name: (not nullable): entry name.
+ * @category: (not nullable): entry category.
+ *
+ * Builds the folded search blob "symbol\0name\0category\0" (each field ASCII-lower-cased, each
+ * followed by a NUL) for one entry in the catalog's string arena.
+ *
+ * Preconditions:
+ *  - @symbol, @name and @category are non-NULL NUL-terminated strings (parse_document() passes
+ *    the arena copies it just made with g_string_chunk_insert() / g_string_chunk_insert_const()).
+ * Postconditions:
+ *  - the blob (exactly three NUL-terminated fields) is stored in @strings; @scratch holds a
+ *    copy of it. This blob layout is what entry_matches() relies on.
+ * Thread affinity: any thread (touches only its arguments).
+ * Ownership: the blob is owned by @strings; nothing else is retained.
+ *
+ * Returns: (transfer none): the blob, valid until @strings is freed.
  */
 static const char *
 make_search_blob(GStringChunk *strings, GString *scratch, const char *symbol,
@@ -67,11 +141,27 @@ make_search_blob(GStringChunk *strings, GString *scratch, const char *symbol,
   return g_string_chunk_insert_len(strings, scratch->str, (gssize)scratch->len);
 }
 
-/* Error text is "catalog: [<label>: ]<message>"; @label (nullable) names the document. */
-static void
-parse_error(GError **error, const char *label, const char *fmt, ...) G_GNUC_PRINTF(3, 4);
-
-static void
+/**
+ * parse_error:
+ * @error: (nullable): return location for a #GError, may be NULL.
+ * @label: (nullable): names the document in the message; NULL for none.
+ * @fmt: (not nullable): printf-style format of the message text.
+ * @...: arguments for @fmt.
+ *
+ * Sets @error to STK_ERROR_PARSE with the text "catalog: [<label>: ]<message>".
+ *
+ * Preconditions:
+ *  - @fmt is a literal matching @... (checked by G_GNUC_PRINTF); @label is NULL or
+ *    NUL-terminated; @error is NULL or points to a NULL #GError pointer (every caller passes
+ *    the error argument of a public function that checked this).
+ * Postconditions:
+ *  - if @error is non-NULL, *@error is a new error in domain STK_ERROR, code STK_ERROR_PARSE.
+ * Thread affinity: any thread.
+ * Ownership: @label and @fmt are only read; the new #GError belongs to the caller.
+ *
+ * Returns: void (the format attribute is written before the name, so doc tools may expect it).
+ */
+static void G_GNUC_PRINTF(3, 4)
 parse_error(GError **error, const char *label, const char *fmt, ...)
 {
   va_list args;
@@ -82,10 +172,38 @@ parse_error(GError **error, const char *label, const char *fmt, ...)
               label != NULL ? ": " : "", msg);
 }
 
-/*
- * Parses one catalog document and appends its items to @entries (strings go to
- * @strings). Nothing is sorted or checked for duplicates here. Returns FALSE
- * with @error set on the first problem; @entries is then discarded by the caller.
+/**
+ * parse_document:
+ * @data: (nullable): JSON text, @len bytes, not required to be NUL-terminated.
+ * @len: length of @data in bytes.
+ * @label: (nullable): document name for error messages.
+ * @entries: (not nullable): array of #StkCatalogEntry that receives the items.
+ * @strings: (not nullable): string arena that owns every string the new entries reference.
+ * @scratch: (not nullable): work buffer for make_search_blob().
+ * @error: (nullable): return location for a #GError, may be NULL.
+ *
+ * Parses one catalog document and appends its items to @entries (strings go to @strings).
+ * Nothing is sorted or checked for duplicates here.
+ *
+ * Preconditions:
+ *  - if @data is non-NULL it points to at least @len readable bytes; @entries, @strings and
+ *    @scratch are valid and used by the caller only.
+ *  - @data is meant to be trusted (compiled-in or caller-built) text: only the cap of
+ *    G_MAXSSIZE bytes is enforced, with no length cap on names/categories. Invalid UTF-8 is
+ *    rejected by json-glib and reported as STK_ERROR_PARSE ("JSON data must be UTF-8 encoded");
+ *    a \u0000 escape inside a name truncates it at that point (probe: "AB\u0000CD" and
+ *    "AB\u0000" are stored as "AB"); a name that starts with \u0000 becomes empty and is
+ *    rejected as STK_ERROR_PARSE ("missing or empty name").
+ * Postconditions:
+ *  - on TRUE every item of the document was appended with fully initialised fields.
+ *  - on FALSE @error is STK_ERROR_PARSE (a NULL @data or @len of 0 gives "empty document"),
+ *    @entries may hold the items appended before the problem and is discarded by the caller.
+ *  - json_parser_load_from_data() returns FALSE only with its error set, so reading
+ *    its message is safe.
+ * Thread affinity: any thread.
+ * Ownership: nothing passed in is retained except the strings copied into @strings.
+ *
+ * Returns: TRUE if the whole document was accepted, FALSE with @error set otherwise.
  */
 static gboolean
 parse_document(const char *data, gsize len, const char *label, GArray *entries,
@@ -178,12 +296,30 @@ parse_document(const char *data, gsize len, const char *label, GArray *entries,
   return TRUE;
 }
 
-/*
- * Builds one catalog from @n_docs documents: every item of every document goes
- * into the single sorted entries array, and a symbol occurring twice (in one
- * document or across documents) rejects the whole catalog. @labels (nullable,
- * one per document) only decorate error messages; without them documents are
+/**
+ * catalog_from_documents:
+ * @datas: (not nullable): @n_docs JSON texts; an individual NULL entry is rejected by
+ *   parse_document() as "empty document".
+ * @lens: (not nullable): @n_docs lengths in bytes.
+ * @labels: (nullable): @n_docs document names for error messages, or NULL.
+ * @n_docs: number of documents; at least 1.
+ * @error: (nullable): return location for a #GError, may be NULL.
+ *
+ * Builds one catalog from @n_docs documents: every item of every document goes into the single
+ * sorted entries array, and a symbol occurring twice (in one document or across documents)
+ * rejects the whole catalog. @labels only decorate error messages; without them documents are
  * called "document N" when there is more than one.
+ *
+ * Preconditions:
+ *  - @datas and @lens have @n_docs elements; @labels, if given, too. Callers: the public
+ *    constructors, which check @error, and (for the arrays) stk_catalog_load_default().
+ * Postconditions:
+ *  - on success the catalog's entries are sorted by symbol in byte order, strictly ascending.
+ *  - on failure nothing is leaked and @error is STK_ERROR_PARSE.
+ * Thread affinity: any thread.
+ * Ownership: inputs are only read (not retained); the result belongs to the caller.
+ *
+ * Returns: (transfer full) (nullable): the new catalog, or NULL with @error set.
  */
 static StkCatalog *
 catalog_from_documents(const char *const *datas, const gsize *lens, const char *const *labels,
@@ -205,7 +341,7 @@ catalog_from_documents(const char *const *datas, const gsize *lens, const char *
   qsort(entries->data, entries->len, sizeof(StkCatalogEntry), entry_cmp);
   const StkCatalogEntry *sorted = (const StkCatalogEntry *)(void *)entries->data;
   for (guint i = 1; i < entries->len; i++) {
-    if (strcmp(sorted[i - 1].symbol, sorted[i].symbol) == 0) {
+    if (g_str_equal(sorted[i - 1].symbol, sorted[i].symbol)) {
       parse_error(error, NULL, "duplicate symbol %s", sorted[i].symbol);
       return NULL;
     }
@@ -218,6 +354,7 @@ catalog_from_documents(const char *const *datas, const gsize *lens, const char *
   return catalog;
 }
 
+/* Documented in stk-catalog.h. */
 StkCatalog *
 stk_catalog_new_from_data(const char *data, gsize len, GError **error)
 {
@@ -225,6 +362,7 @@ stk_catalog_new_from_data(const char *data, gsize len, GError **error)
   return catalog_from_documents(&data, &len, NULL, 1, error);
 }
 
+/* Documented in stk-catalog.h. */
 StkCatalog *
 stk_catalog_new_from_documents(const char *const *datas, const gsize *lens, guint n_docs,
                                GError **error)
@@ -234,7 +372,25 @@ stk_catalog_new_from_documents(const char *const *datas, const gsize *lens, guin
   return catalog_from_documents(datas, lens, NULL, n_docs, error);
 }
 
-/* Looks up one embedded document; sets NOT_FOUND and returns NULL if missing. */
+/**
+ * lookup_resource:
+ * @path: (not nullable): GResource path of the embedded document.
+ * @error: (nullable): return location for a #GError, may be NULL.
+ *
+ * Looks up one embedded document; sets NOT_FOUND and returns NULL if missing.
+ *
+ * Preconditions:
+ *  - @path is a NUL-terminated string (the caller passes the CATALOG_RESOURCE_* literals).
+ * Postconditions:
+ *  - on failure @error is STK_ERROR_NOT_FOUND, "catalog resource missing: <reason>".
+ *    g_resource_lookup_data() returns NULL only with its error set, so reading that
+ *    error's message is safe.
+ * Thread affinity: any thread (GResource lookup is thread-safe).
+ * Ownership: @path is only read.
+ *
+ * Returns: (transfer full) (nullable): the document bytes (release with g_bytes_unref()), or
+ *   NULL with @error set.
+ */
 static GBytes *
 lookup_resource(const char *path, GError **error)
 {
@@ -247,6 +403,7 @@ lookup_resource(const char *path, GError **error)
   return bytes;
 }
 
+/* Documented in stk-catalog.h. */
 StkCatalog *
 stk_catalog_load_default(GError **error)
 {
@@ -274,6 +431,7 @@ out:
   return catalog;
 }
 
+/* Documented in stk-catalog.h. */
 void
 stk_catalog_free(StkCatalog *catalog)
 {
@@ -284,6 +442,7 @@ stk_catalog_free(StkCatalog *catalog)
   g_free(catalog);
 }
 
+/* Documented in stk-catalog.h. */
 const StkCatalogEntry *
 stk_catalog_entries(const StkCatalog *catalog, gsize *n_entries)
 {
@@ -292,6 +451,7 @@ stk_catalog_entries(const StkCatalog *catalog, gsize *n_entries)
   return catalog->entries;
 }
 
+/* Documented in stk-catalog.h. */
 const StkCatalogEntry *
 stk_catalog_lookup(const StkCatalog *catalog, const char *symbol)
 {
@@ -299,15 +459,19 @@ stk_catalog_lookup(const StkCatalog *catalog, const char *symbol)
   if (!stk_symbol_is_valid(symbol))
     return NULL;
 
+  /* Bounded length: stk_symbol_is_valid() proved a NUL within SYMBOL_BUF bytes, so n <= 15. */
+  const char *nul = memchr(symbol, '\0', SYMBOL_BUF);
+  if (nul == NULL)
+    return NULL;
   char key[SYMBOL_BUF];
-  gsize n = strlen(symbol); /* <= 15 once valid */
+  gsize n = (gsize)(nul - symbol);
   for (gsize i = 0; i <= n; i++)
     key[i] = g_ascii_toupper(symbol[i]);
 
   gsize lo = 0, hi = catalog->n_entries;
   while (lo < hi) {
     gsize mid = lo + (hi - lo) / 2;
-    int c = strcmp(catalog->entries[mid].symbol, key);
+    int c = g_strcmp0(catalog->entries[mid].symbol, key);
     if (c == 0)
       return &catalog->entries[mid];
     if (c < 0)
@@ -318,7 +482,27 @@ stk_catalog_lookup(const StkCatalog *catalog, const char *symbol)
   return NULL;
 }
 
-/* TRUE if @query (qlen > 0, folded on the fly) occurs in the lower-cased @hay. */
+/**
+ * contains_folded:
+ * @hay: (not nullable): lower-cased NUL-terminated text to search.
+ * @query: (not nullable): text to look for, at least @qlen readable bytes, none of the first
+ *   @qlen bytes a NUL.
+ * @qlen: number of bytes of @query to use; greater than 0.
+ *
+ * TRUE if @query (folded on the fly) occurs in the lower-cased @hay.
+ *
+ * Preconditions:
+ *  - @hay is NUL-terminated and @query holds @qlen non-NUL bytes. Because of the latter the
+ *    comparison stops at the NUL of @hay, so no read passes it. @qlen is computed by
+ *    stk_catalog_filter() from a bounded NUL scan of @query and passed unchanged through
+ *    entry_matches().
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: nothing is retained.
+ *
+ * Returns: TRUE if @hay contains @query ignoring ASCII case, FALSE otherwise.
+ */
 static gboolean
 contains_folded(const char *hay, const char *query, gsize qlen)
 {
@@ -332,6 +516,25 @@ contains_folded(const char *hay, const char *query, gsize qlen)
   return FALSE;
 }
 
+/**
+ * entry_matches:
+ * @e: (not nullable): entry of a catalog built by catalog_from_documents().
+ * @query: (not nullable): text to look for, with @qlen non-NUL bytes.
+ * @qlen: length of @query in bytes; greater than 0.
+ *
+ * Whether @query occurs in the symbol, the name or the category of @e (each on its own).
+ *
+ * Preconditions:
+ *  - @e->search is the blob made by make_search_blob(): three NUL-terminated fields. Entries
+ *    are created only by parse_document(), so every entry reachable through a #StkCatalog
+ *    has it.
+ * Postconditions:
+ *  - no state is changed. The walk visits at most three fields and stops at a missing NUL.
+ * Thread affinity: any thread (read-only).
+ * Ownership: nothing is retained.
+ *
+ * Returns: TRUE if any of the three fields contains @query ignoring ASCII case, else FALSE.
+ */
 static gboolean
 entry_matches(const StkCatalogEntry *e, const char *query, gsize qlen)
 {
@@ -339,18 +542,30 @@ entry_matches(const StkCatalogEntry *e, const char *query, gsize qlen)
   for (int i = 0; i < 3; i++) {
     if (contains_folded(field, query, qlen))
       return TRUE;
-    field += strlen(field) + 1;
+    const char *end = memchr(field, '\0', TEXT_SCAN_MAX);
+    if (end == NULL)
+      return FALSE;
+    field = end + 1;
   }
   return FALSE;
 }
 
+/* Documented in stk-catalog.h. */
 const StkCatalogEntry **
 stk_catalog_filter(const StkCatalog *catalog, StkCatalogKindFilter kind, const char *query,
                    gsize *n_results)
 {
   g_return_val_if_fail(catalog != NULL && n_results != NULL, NULL);
 
-  gsize qlen = query != NULL ? strlen(query) : 0;
+  gsize qlen = 0;
+  if (query != NULL) {
+    const char *qend = memchr(query, '\0', TEXT_SCAN_MAX);
+    if (qend == NULL) {
+      *n_results = 0;
+      return NULL;
+    }
+    qlen = (gsize)(qend - query);
+  }
   const StkCatalogEntry **out = g_new(const StkCatalogEntry *, catalog->n_entries);
   gsize n = 0;
 

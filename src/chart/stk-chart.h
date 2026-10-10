@@ -77,6 +77,18 @@ G_DECLARE_FINAL_TYPE(StkChart, stk_chart, STK, CHART, GtkWidget)
 /**
  * stk_chart_new:
  *
+ * Creates an empty chart.
+ *
+ * Preconditions:
+ *  - GTK is initialised (a widget is created); call from the main thread.
+ * Postconditions:
+ *  - the chart has no data and shows "No data"; it expands in both directions
+ *    and requests at least 120x80 px (natural 320x200). It is a floating
+ *    reference.
+ * Thread affinity: main thread only.
+ * Ownership: the caller owns the floating reference and must sink/adopt it
+ *   (e.g. by adding it to a container).
+ *
  * Returns: (transfer floating): a new, empty chart (shows "No data"). It
  *   expands in both directions and requests at least 120x80 px (natural
  *   320x200).
@@ -85,7 +97,7 @@ GtkWidget *stk_chart_new(void);
 
 /**
  * stk_chart_set_series:
- * @self: a StkChart.
+ * @self: (not nullable): a StkChart.
  * @series: (nullable) (transfer none): the series to show, or NULL / an empty
  *   series for "No data".
  *
@@ -96,18 +108,42 @@ GtkWidget *stk_chart_new(void);
  *
  * A series whose samples all lie outside the displayed domain (1D data that
  * is entirely pre-/after-market) shows "No data".
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_CHART() (otherwise a critical is logged and
+ *    nothing happens); @series is NULL or a valid StkSeries whose points
+ *    array holds n_points samples, not modified during the call.
+ * Postconditions:
+ *  - at most STK_CHART_GEOM_MAX_SAMPLES samples are copied, whatever the
+ *    series length; the geometry is rebuilt lazily at the next draw and a
+ *    redraw is queued. After the widget was disposed the call is a no-op.
+ * Thread affinity: main thread only.
+ * Ownership: @series is borrowed for the call and not retained; the copies
+ *   are owned by @self and freed in finalize.
+ *
+ * Returns: void.
  */
 void stk_chart_set_series(StkChart *self, StkSeries *series);
 
 /**
  * stk_chart_set_stale:
- * @self: a StkChart.
+ * @self: (not nullable): a StkChart.
  * @stale: whether the shown data is out of date (e.g. cached after a failed
  *   refresh).
  *
  * Shows (TRUE) or hides (FALSE) a "Stale" marker in the top-right of the
  * strip above the plot, also when there is no data. Changing the flag clears
  * the hover state and redraws; setting the current value does nothing.
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_CHART() (otherwise a critical is logged and
+ *    nothing happens).
+ * Postconditions:
+ *  - the flag equals !!@stale; a redraw is queued only when it changed.
+ * Thread affinity: main thread only.
+ * Ownership: @self is borrowed; nothing is retained.
+ *
+ * Returns: void.
  */
 void stk_chart_set_stale(StkChart *self, gboolean stale);
 

@@ -38,6 +38,16 @@ G_DECLARE_FINAL_TYPE(StkSparkline, stk_sparkline, STK, SPARKLINE, GtkWidget)
 /**
  * stk_sparkline_new:
  *
+ * Creates an empty sparkline.
+ *
+ * Preconditions:
+ *  - GTK is initialised (a widget is created); call from the main thread.
+ * Postconditions:
+ *  - the widget has no series and draws nothing; it is a floating reference.
+ * Thread affinity: main thread only.
+ * Ownership: the caller owns the floating reference and must sink/adopt it
+ *   (e.g. by adding it to a container).
+ *
  * Returns: (transfer floating): a new sparkline that draws nothing until a
  *   series with samples is set.
  */
@@ -45,13 +55,29 @@ GtkWidget *stk_sparkline_new(void);
 
 /**
  * stk_sparkline_set_series:
- * @self: a StkSparkline.
+ * @self: (not nullable): a StkSparkline.
  * @series: (nullable) (transfer none): series to draw, or NULL / empty to
  *   draw nothing.
  *
  * Copies what it needs and keeps no reference to @series (see
  * stk_chart_set_series(); later appends need another call; 1D samples outside
  * the session are not drawn). Updates the "positive"/"negative" CSS class.
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_SPARKLINE() (otherwise a critical is logged and
+ *    nothing happens); @series is NULL or a valid StkSeries whose points
+ *    array holds n_points samples, not modified during the call.
+ * Postconditions:
+ *  - the previous path is released and replaced; the CSS class is "positive"
+ *    or "negative" when something is drawn and neither otherwise; a redraw is
+ *    queued. After the widget was disposed the call is a no-op.
+ *  - memory use is bounded: at most 272 samples are held on the stack,
+ *    whatever the series length.
+ * Thread affinity: main thread only.
+ * Ownership: @series is borrowed for the call and not retained; @self keeps
+ *   ownership of its own path.
+ *
+ * Returns: void.
  */
 void stk_sparkline_set_series(StkSparkline *self, StkSeries *series);
 

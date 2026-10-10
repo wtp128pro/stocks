@@ -4,15 +4,37 @@
 
 #include "stk-fileio.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
+/**
+ * set_errno_error:
+ * @error: (nullable): return location for a #GError, may be NULL.
+ * @err: an errno value.
+ * @what: (not nullable): short description of the failed step.
+ * @path: (not nullable): file or directory the step applied to.
+ *
+ * Sets @error to a G_FILE_ERROR whose code is mapped from @err and whose
+ * message is "<what> '<path>': <strerror>".
+ *
+ * Preconditions:
+ *  - @what and @path are NUL-terminated; @error is NULL or points to a NULL
+ *    #GError pointer (call sites: only on a fresh error path).
+ * Postconditions:
+ *  - *@error holds a new #GError when @error is non-NULL; nothing else changes.
+ * Thread affinity: any thread (the call sites pass a local or caller-owned
+ *   @error).
+ * Ownership: @what and @path are borrowed; the new #GError is owned by the
+ *   caller of the public function through @error.
+ */
 static void
 set_errno_error(GError **error, int err, const char *what, const char *path)
 {
@@ -20,7 +42,21 @@ set_errno_error(GError **error, int err, const char *what, const char *path)
               path, g_strerror(err));
 }
 
-/* Best effort: make the rename durable. Failures are deliberately ignored. */
+/**
+ * sync_directory:
+ * @dir: (not nullable): directory path.
+ *
+ * Best effort: makes the rename durable by fsync()ing the directory. Failures
+ * are deliberately ignored.
+ *
+ * Preconditions:
+ *  - @dir is NUL-terminated (call site: g_path_get_dirname() result).
+ * Postconditions:
+ *  - the directory descriptor opened here is closed again; no file is
+ *    changed.
+ * Thread affinity: any thread (blocks on disk I/O).
+ * Ownership: @dir is borrowed for the call only.
+ */
 static void
 sync_directory(const char *dir)
 {
@@ -31,6 +67,7 @@ sync_directory(const char *dir)
   (void)close(fd);
 }
 
+/* Documented in stk-fileio.h. */
 gboolean
 stk_file_write_atomic(const char *path, const char *data, gsize len, GError **error)
 {
@@ -82,6 +119,7 @@ stk_file_write_atomic(const char *path, const char *data, gsize len, GError **er
   return TRUE;
 }
 
+/* Documented in stk-fileio.h. */
 gboolean
 stk_file_read_bounded(const char *path, gsize max_bytes, char **contents, gsize *length,
                       GError **error)
@@ -122,7 +160,9 @@ stk_file_read_bounded(const char *path, gsize max_bytes, char **contents, gsize 
 
   /* Never read more than limit = max_bytes + 1 bytes: reaching it proves the
    * file (which may have grown since fstat) exceeds max_bytes. One more byte
-   * is reserved for the terminating NUL. */
+   * is reserved for the terminating NUL. Overflow: max_bytes < G_MAXSIZE / 4
+   * (checked on entry) and st_size <= max_bytes (checked above), so limit,
+   * st_size + 1 and every alloc <= limit + 1 (hence alloc * 2) fit a gsize. */
   const gsize limit = max_bytes + 1;
   gsize alloc = MIN((gsize)st.st_size + 1, limit) + 1;
   char *buf = g_malloc(alloc);
@@ -169,23 +209,51 @@ stk_file_read_bounded(const char *path, gsize max_bytes, char **contents, gsize 
 #define STALE_TEMP_AGE_SECONDS 60
 #define TEMP_SUFFIX_LEN 6
 
-/* Matches exactly "<base>" + STK_TEMP_INFIX + six ASCII letters/digits. */
+/**
+ * is_temp_name:
+ * @name: (not nullable): directory entry name (a dirent d_name).
+ * @base: (not nullable): base name of the data file, NUL-terminated.
+ * @base_len: length of @base without the NUL.
+ *
+ * Matches exactly "<base>" + STK_TEMP_INFIX + six ASCII letters/digits.
+ * Bounds proof: the length of @name is found with memchr() inside the first
+ * NAME_MAX + 1 bytes (POSIX: a d_name is NUL-terminated within that), and
+ * both memcmp() calls and the suffix scan run only after the total length has
+ * been shown to equal @base_len + the infix length + TEMP_SUFFIX_LEN, so
+ * nothing is read past the NUL of @name.
+ *
+ * Preconditions:
+ *  - @name is a dirent d_name (NUL within NAME_MAX + 1 bytes); @base is
+ *    NUL-terminated and @base_len is its length (call site: it is taken
+ *    from the g_path_get_basename() result).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure).
+ * Ownership: @name and @base are borrowed for the call only.
+ *
+ * Returns: TRUE iff @name has the temporary-file form described above.
+ */
 static gboolean
 is_temp_name(const char *name, const char *base, gsize base_len)
 {
-  const gsize infix_len = strlen(STK_TEMP_INFIX);
-  if (strncmp(name, base, base_len) != 0 ||
-      strncmp(name + base_len, STK_TEMP_INFIX, infix_len) != 0)
+  const gsize infix_len = sizeof STK_TEMP_INFIX - 1;
+  const char *nul = memchr(name, '\0', NAME_MAX + 1);
+  if (nul == NULL)
+    return FALSE;
+  const gsize name_len = (gsize)(nul - name);
+  if (name_len < base_len || name_len - base_len != infix_len + TEMP_SUFFIX_LEN)
+    return FALSE;
+  if (memcmp(name, base, base_len) != 0 ||
+      memcmp(name + base_len, STK_TEMP_INFIX, infix_len) != 0)
     return FALSE;
   const char *suffix = name + base_len + infix_len;
-  if (strlen(suffix) != TEMP_SUFFIX_LEN)
-    return FALSE;
   for (gsize i = 0; i < TEMP_SUFFIX_LEN; i++)
     if (!g_ascii_isalnum(suffix[i]))
       return FALSE;
   return TRUE;
 }
 
+/* Documented in stk-fileio.h. */
 void
 stk_file_remove_stale_temps(const char *path)
 {
@@ -193,25 +261,55 @@ stk_file_remove_stale_temps(const char *path)
 
   g_autofree char *dir = g_path_get_dirname(path);
   g_autofree char *base = g_path_get_basename(path);
+  /* strlen on a string that g_path_get_basename() has just created. */
   const gsize base_len = strlen(base);
-  GDir *d = g_dir_open(dir, 0, NULL);
-  if (d == NULL)
+  int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd < 0)
     return;
+  DIR *d = fdopendir(dfd); /* takes over dfd on success */
+  if (d == NULL) {
+    (void)close(dfd);
+    return;
+  }
   const time_t now = time(NULL);
-  const char *name;
-  while ((name = g_dir_read_name(d)) != NULL) {
+  const struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    const char *name = ent->d_name;
     if (!is_temp_name(name, base, base_len))
       continue;
-    g_autofree char *full = g_build_filename(dir, name, NULL);
     struct stat st;
-    if (lstat(full, &st) == 0 && S_ISREG(st.st_mode) && now - st.st_mtime > STALE_TEMP_AGE_SECONDS)
-      (void)g_unlink(full);
+    /* difftime() instead of "now - st_mtime": the signed time_t subtraction
+     * could overflow for a hostile mtime; for in-range values the result is
+     * the same as before (younger and future-dated files are kept). */
+    if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+        difftime(now, st.st_mtime) > STALE_TEMP_AGE_SECONDS)
+      (void)unlinkat(dfd, name, 0);
   }
-  g_dir_close(d);
+  (void)closedir(d); /* also closes dfd */
 }
 
-/* Pops the innermost container: returns FALSE if none is open or if it is not
- * of the kind @want (bit 1 = object, bit 0 = array). */
+/**
+ * pop_container:
+ * @kinds: (not nullable) (inout): bit i is 1 when the container at depth i is
+ *   an object.
+ * @depth: (not nullable) (inout): number of open containers.
+ * @want: kind expected for the innermost container (1 = object, 0 = array).
+ *
+ * Pops the innermost container: returns FALSE if none is open or if it is not
+ * of the kind @want.
+ *
+ * Preconditions:
+ *  - @kinds and @depth point to the caller's locals; *@depth <= 32 (call site:
+ *    stk_json_check_strict() never opens more than max_depth <= 32), so the
+ *    shift below stays in 0..31 after the decrement.
+ * Postconditions:
+ *  - *@depth is decremented when it was non-zero (also when the kind does not
+ *    match); *@kinds is not modified.
+ * Thread affinity: any thread (touches only the caller's locals).
+ * Ownership: none (the pointers are borrowed locals).
+ *
+ * Returns: TRUE iff a container was open and it was of kind @want.
+ */
 static gboolean
 pop_container(guint32 *kinds, guint *depth, guint32 want)
 {
@@ -221,6 +319,7 @@ pop_container(guint32 *kinds, guint *depth, guint32 want)
   return ((*kinds >> *depth) & 1u) == want;
 }
 
+/* Documented in stk-fileio.h. */
 gboolean
 stk_json_check_strict(const char *text, gsize len, guint max_depth)
 {
@@ -294,6 +393,7 @@ stk_json_check_strict(const char *text, gsize len, guint max_depth)
   return depth == 0;
 }
 
+/* Documented in stk-fileio.h. */
 void
 stk_json_append_string(GString *out, const char *s)
 {

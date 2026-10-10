@@ -58,6 +58,14 @@ typedef enum {
  * twice, in one file or across the two files, rejects the whole catalog. Does
  * no network or filesystem access. Call it once and share the result.
  *
+ * Preconditions:
+ *  - @error is NULL or points to a NULL #GError pointer (checked: critical and NULL otherwise).
+ * Postconditions:
+ *  - on success a new catalog owned by the caller; on failure NULL, nothing is leaked and, if
+ *    @error is non-NULL, *@error is set.
+ * Thread affinity: any thread (no GTK or main-loop use).
+ * Ownership: the caller owns the returned catalog; the embedded resources are not retained.
+ *
  * Returns: (transfer full): the catalog, or NULL with @error set
  *   (STK_ERROR_NOT_FOUND if a resource is missing, STK_ERROR_PARSE if a
  *   file's content is invalid (message names that file) or a symbol occurs
@@ -83,6 +91,26 @@ StkCatalog *stk_catalog_load_default(GError **error);
  *   - no symbol occurs twice.
  * Items may appear in any order; the catalog is sorted by symbol (byte order).
  *
+ * Preconditions:
+ *  - @error is NULL or points to a NULL #GError pointer (checked: critical and NULL otherwise).
+ *  - @data is NULL (then rejected as "empty document") or points to at least @len readable
+ *    bytes.
+ *  - @data is TRUSTED text (compiled-in data or data the program built itself): the only
+ *    byte-size limit is G_MAXSSIZE bytes and names and categories have no length limit. Invalid
+ *    UTF-8 is rejected by json-glib and reported as STK_ERROR_PARSE ("JSON data must be UTF-8
+ *    encoded"); a \u0000 escape inside a name truncates it at that point (probe:
+ *    "AB\u0000CD" and "AB\u0000" are stored as "AB"); a name that starts with \u0000 becomes
+ *    empty and is rejected as STK_ERROR_PARSE ("missing or empty name"). In this tree only the
+ *    test programs call this function; the application loads its catalog with
+ *    stk_catalog_load_default(). Do
+ *    not pass untrusted network or file data without validating it first.
+ * Postconditions:
+ *  - on success a new catalog owned by the caller; @data is not retained (all text is copied).
+ *  - on failure NULL; nothing is leaked and, if @error is non-NULL, *@error is set
+ *    (@data NULL or @len 0 gives "empty document").
+ * Thread affinity: any thread.
+ * Ownership: the caller keeps @data; the caller owns the returned catalog.
+ *
  * Returns: (transfer full): the catalog, or NULL with @error set to
  *   STK_ERROR_PARSE (message names the offending item). Never crashes on bad
  *   input. Release with stk_catalog_free().
@@ -102,6 +130,24 @@ StkCatalog *stk_catalog_new_from_data(const char *data, gsize len, GError **erro
  * symbol occurring twice, within one document or across documents, rejects
  * the whole catalog.
  *
+ * Preconditions:
+ *  - @error is NULL or points to a NULL #GError pointer, and @datas, @lens are non-NULL and
+ *    @n_docs is at least 1 (all checked: critical and NULL otherwise).
+ *  - @datas and @lens have @n_docs elements. An individual NULL @datas[i] (or a length of 0)
+ *    is not a programming error: it is rejected as "empty document" (STK_ERROR_PARSE).
+ *  - every non-NULL @datas[i] points to @lens[i] readable bytes.
+ *  - the same TRUSTED-data precondition as stk_catalog_new_from_data() applies; only the test
+ *    programs call this function in this tree. Invalid UTF-8 is rejected by json-glib and
+ *    reported as STK_ERROR_PARSE ("JSON data must be UTF-8 encoded");
+ *    a \u0000 escape inside a name truncates it at that point (probe: "AB\u0000CD" and
+ *    "AB\u0000" are stored as "AB"); a name that starts with \u0000 becomes empty and is
+ *    rejected as STK_ERROR_PARSE ("missing or empty name").
+ * Postconditions:
+ *  - on success a new catalog owned by the caller; no input is retained.
+ *  - on failure NULL; nothing is leaked and, if @error is non-NULL, *@error is set.
+ * Thread affinity: any thread.
+ * Ownership: the caller keeps the arrays and texts; the caller owns the returned catalog.
+ *
  * Returns: (transfer full): the catalog, or NULL with @error set to
  *   STK_ERROR_PARSE (with several documents the message names the offending
  *   one as "document N", counting from 1; a duplicate message names the
@@ -110,27 +156,61 @@ StkCatalog *stk_catalog_new_from_data(const char *data, gsize len, GError **erro
 StkCatalog *stk_catalog_new_from_documents(const char *const *datas, const gsize *lens,
                                            guint n_docs, GError **error);
 
-/** Frees @catalog and every entry/string obtained from it. NULL is allowed. */
+/**
+ * stk_catalog_free:
+ * @catalog: (nullable) (transfer full): the catalog to free; NULL is a no-op.
+ *
+ * Frees @catalog and every entry/string obtained from it.
+ *
+ * Preconditions:
+ *  - @catalog is NULL or came from a stk_catalog_* constructor and is not freed twice.
+ *  - no other thread is querying @catalog; no entry or string taken from it is used afterwards.
+ * Postconditions:
+ *  - the catalog, its entries array and its string arena are released.
+ * Thread affinity: any thread, but not concurrently with queries on the same catalog.
+ * Ownership: takes ownership of @catalog.
+ */
 void stk_catalog_free(StkCatalog *catalog);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(StkCatalog, stk_catalog_free)
 
 /**
  * stk_catalog_entries:
- * @catalog: non-NULL catalog.
- * @n_entries: (out): receives the number of entries.
+ * @catalog: (not nullable): the catalog; non-NULL (checked: critical and NULL otherwise).
+ * @n_entries: (out) (not nullable): receives the number of entries; non-NULL (checked as
+ *   for @catalog).
+ *
+ * Gives access to the whole sorted entry array.
+ *
+ * Preconditions:
+ *  - @catalog is a live catalog; @n_entries is writable.
+ * Postconditions:
+ *  - *@n_entries is set on success; nothing is allocated. On a failed precondition it is
+ *    untouched.
+ * Thread affinity: any thread (read-only).
+ * Ownership: the array stays owned by @catalog.
  *
  * Returns: (transfer none): the entries sorted strictly ascending by symbol
- *   (strcmp order). Read-only; valid until stk_catalog_free(). Never NULL.
+ *   (byte order). Read-only; valid until stk_catalog_free(). Never NULL.
  */
 const StkCatalogEntry *stk_catalog_entries(const StkCatalog *catalog, gsize *n_entries);
 
 /**
  * stk_catalog_lookup:
- * @catalog: non-NULL catalog.
+ * @catalog: (not nullable): the catalog; non-NULL (checked: critical and NULL otherwise).
  * @symbol: (nullable): ticker to find. Matched ASCII case-insensitively.
  *
  * Binary search; allocates nothing.
+ *
+ * Preconditions:
+ *  - @catalog is a live catalog.
+ *  - @symbol is NULL, a NUL-terminated string, or at least 16 readable bytes (only the first
+ *    16 bytes are examined, see stk_symbol_is_valid()).
+ * Postconditions:
+ *  - no state is changed. The key is upper-cased into a local 16-byte buffer only after
+ *    stk_symbol_is_valid() proved at most 15 bytes plus NUL.
+ * Thread affinity: any thread (read-only).
+ * Ownership: @symbol is only read; the returned entry is owned by @catalog.
  *
  * Returns: (transfer none) (nullable): the entry, or NULL if @symbol is NULL,
  *   fails stk_symbol_is_valid() or is not in the catalog. Valid until
@@ -140,18 +220,31 @@ const StkCatalogEntry *stk_catalog_lookup(const StkCatalog *catalog, const char 
 
 /**
  * stk_catalog_filter:
- * @catalog: non-NULL catalog.
+ * @catalog: (not nullable): the catalog; non-NULL (checked: critical and NULL otherwise).
  * @kind: which instrument class to keep.
  * @query: (nullable): text to look for; NULL or "" keeps everything. An entry
  *   matches when @query occurs as a contiguous substring of its symbol, its
  *   name or its category (each field on its own), ignoring ASCII case.
  *   Non-ASCII bytes are compared exactly. Surrounding whitespace is not
  *   trimmed. Queries of any length are accepted.
- * @n_results: (out): receives the number of results.
+ * @n_results: (out) (not nullable): receives the number of results; non-NULL (checked:
+ *   critical and NULL otherwise).
  *
- * One linear pass over the precomputed entries; the only allocation is the
- * returned array (sized for the whole catalog, filled for the first
- * *@n_results slots).
+ * One linear pass over the precomputed entries; the only allocation is one array sized for
+ * the whole catalog, filled for the first *@n_results slots; it is returned, or freed
+ * again when nothing matches.
+ *
+ * Preconditions:
+ *  - @catalog is a live catalog; @n_results is writable.
+ *  - @query is NULL or NUL-terminated. No length cap is applied; the cost is one NUL scan of
+ *    the query plus a substring search of every field whose cost grows with the field length
+ *    times the query length.
+ * Postconditions:
+ *  - *@n_results is set on success. The entries stay owned by @catalog. When nothing matches
+ *    the result is NULL and no allocation outlives the call (the internal array is freed);
+ *    otherwise the only allocation that outlives the call is the returned array.
+ * Thread affinity: any thread (read-only).
+ * Ownership: @query is only read; the caller owns the returned array (not the entries).
  *
  * Returns: (transfer container) (nullable): pointers to the matching entries
  *   in symbol order, or NULL when nothing matches (*@n_results == 0). Free the

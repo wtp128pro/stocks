@@ -42,12 +42,26 @@ G_DECLARE_FINAL_TYPE(StkRouter, stk_router, STK, ROUTER, GObject)
 
 /**
  * stk_router_new:
- * @primary: a StkProvider for every non-'^' symbol and for search (StkNasdaq
+ * @primary: (not nullable): a StkProvider for every non-'^' symbol and for search (StkNasdaq
  *   in the app). A reference is taken.
- * @index_provider: a StkProvider for '^' symbols (StkYahoo in the app). A
+ * @index_provider: (not nullable): a StkProvider for '^' symbols (StkYahoo in the app). A
  *   reference is taken. It may be the same object as @primary.
  *
- * Returns: (transfer full): a StkProvider routing as described above.
+ * Creates a router over the two providers.
+ *
+ * Preconditions:
+ *  - @primary and @index_provider satisfy STK_IS_PROVIDER() (violations are a
+ *    g_return_val_if_fail() critical returning NULL).
+ *  - Called from the thread that will run the GLib main context.
+ * Postconditions:
+ *  - The router holds one reference to each provider (two references if they are the same
+ *    object), released when it is disposed.
+ * Thread affinity: main thread only.
+ * Ownership: @primary and @index_provider stay with the caller (a reference is taken on each);
+ *   the caller owns the returned reference.
+ *
+ * Returns: (transfer full) (nullable): a StkProvider routing as described above, or NULL (with a
+ *   critical) if a precondition is violated.
  */
 StkRouter *stk_router_new(StkProvider *primary, StkProvider *index_provider);
 

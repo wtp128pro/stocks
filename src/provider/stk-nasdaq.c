@@ -5,7 +5,8 @@
  * See stk-nasdaq.h for the behaviour contract.
  *
  * Layout: URL builders, JSON helpers, response parsers (pure), then the
- * request layer (one GTask per operation, one libsoup message per attempt)
+ * request layer (one GTask per request, one libsoup message per attempt; a 1D series joins two
+ * requests under a third task)
  * shared by quote / series / search, then the StkProvider glue.
  */
 #include "stk-nasdaq.h"
@@ -32,6 +33,16 @@
 
 #define SEARCH_TEXT_MAX_BYTES 64
 #define READ_CHUNK_BYTES (16 * 1024)
+/* Longest accepted external company name, bytes (same bound as StkYahoo). */
+#define NAME_MAX_BYTES 256
+/* Upper bound of the backoff_base_ms argument of stk_nasdaq_new_custom(). */
+#define BACKOFF_BASE_MAX_MS 600000
+
+/* Size arithmetic of the request layer: the body buffer is sized with guint
+ * (GByteArray), so cap + 1 must fit; schedule_retry() shifts the back-off base
+ * left by at most STK_NASDAQ_MAX_RETRIES - 1 and casts the result to guint. */
+G_STATIC_ASSERT((guint64)STK_NASDAQ_MAX_BODY_BYTES + 1 <= G_MAXUINT);
+G_STATIC_ASSERT(((guint64)BACKOFF_BASE_MAX_MS << STK_NASDAQ_MAX_RETRIES) <= G_MAXUINT);
 /* libsoup has no constant for 429. */
 #define HTTP_TOO_MANY_REQUESTS 429
 
@@ -39,18 +50,68 @@
 /* Small helpers                                                            */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * kind_is_valid:
+ * @kind: any StkKind value (or an out-of-range integer)
+ *
+ * Tells whether @kind is served by this provider (stock, ETF or mutual fund; STK_KIND_INDEX and
+ * out-of-range values are not).
+ *
+ * Preconditions:
+ *  - none.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure)
+ * Ownership: none (no pointers).
+ *
+ * Returns: TRUE for STK_KIND_STOCK, STK_KIND_ETF and STK_KIND_FUND, FALSE otherwise.
+ */
 static gboolean
 kind_is_valid(StkKind kind)
 {
   return kind == STK_KIND_STOCK || kind == STK_KIND_ETF || kind == STK_KIND_FUND;
 }
 
+/**
+ * range_is_valid:
+ * @range: any StkRange value (or an out-of-range integer)
+ *
+ * Tells whether @range is a StkRange enumerator (relies on the enumerators STK_RANGE_1D ..
+ * STK_RANGE_1Y being contiguous and in that order).
+ *
+ * Preconditions:
+ *  - none.
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: any thread (pure)
+ * Ownership: none (no pointers).
+ *
+ * Returns: TRUE if STK_RANGE_1D <= @range <= STK_RANGE_1Y, FALSE otherwise.
+ */
 static gboolean
 range_is_valid(StkRange range)
 {
   return range >= STK_RANGE_1D && range <= STK_RANGE_1Y;
 }
 
+/**
+ * assetclass_of:
+ * @kind: a kind accepted by kind_is_valid()
+ *
+ * Maps a kind to the "assetclass" query value of the Nasdaq API.
+ *
+ * Preconditions:
+ *  - kind_is_valid(@kind): the callers (stk_nasdaq_quote_url(), stk_nasdaq_series_url()) call it
+ *    only after check_symbol_kind() succeeded.
+ * Postconditions:
+ *  - no state is changed. For an invalid @kind (never happens through the callers)
+ *    g_return_val_if_reached() logs a critical and returns NULL; this replaces the former
+ *    g_assert_not_reached().
+ * Thread affinity: any thread (pure)
+ * Ownership: the returned string is a static literal; nothing is allocated.
+ *
+ * Returns: "stocks", "etf" or "mutualfunds"; NULL (with a critical) for an invalid @kind.
+ */
 static const char *
 assetclass_of(StkKind kind)
 {
@@ -62,11 +123,28 @@ assetclass_of(StkKind kind)
   case STK_KIND_FUND:
     return "mutualfunds";
   default:
-    g_assert_not_reached();
+    g_return_val_if_reached(NULL);
   }
 }
 
-/* Calendar months covered by a daily range. */
+/**
+ * months_of:
+ * @range: one of STK_RANGE_1M, STK_RANGE_3M, STK_RANGE_6M, STK_RANGE_1Y
+ *
+ * Maps a daily range to the number of calendar months it covers.
+ *
+ * Preconditions:
+ *  - @range is not STK_RANGE_1D and range_is_valid(): the only caller, stk_nasdaq_series_url(),
+ *    returns for invalid ranges and for STK_RANGE_1D before calling it.
+ * Postconditions:
+ *  - no state is changed. For any other value (never happens through the caller)
+ *    g_return_val_if_reached() logs a critical and returns 0; this replaces the former
+ *    g_assert_not_reached().
+ * Thread affinity: any thread (pure)
+ * Ownership: none (no pointers).
+ *
+ * Returns: 1, 3, 6 or 12; 0 (with a critical) for an unsupported @range.
+ */
 static guint
 months_of(StkRange range)
 {
@@ -80,11 +158,29 @@ months_of(StkRange range)
   case STK_RANGE_1Y:
     return 12;
   default:
-    g_assert_not_reached();
+    g_return_val_if_reached(0);
   }
 }
 
-/* "limit" for /historical: above the number of trading days in the window. */
+/**
+ * historical_limit_of:
+ * @range: one of STK_RANGE_1M, STK_RANGE_3M, STK_RANGE_6M, STK_RANGE_1Y
+ *
+ * Maps a daily range to the "limit" parameter of the /historical endpoint, which is above the
+ * number of trading days in the window.
+ *
+ * Preconditions:
+ *  - @range is not STK_RANGE_1D and range_is_valid(): the only caller, stk_nasdaq_series_url(),
+ *    reaches it only after the same checks as for months_of().
+ * Postconditions:
+ *  - no state is changed. For any other value (never happens through the caller)
+ *    g_return_val_if_reached() logs a critical and returns 0; this replaces the former
+ *    g_assert_not_reached().
+ * Thread affinity: any thread (pure)
+ * Ownership: none (no pointers).
+ *
+ * Returns: 40, 100, 200 or 400; 0 (with a critical) for an unsupported @range.
+ */
 static guint
 historical_limit_of(StkRange range)
 {
@@ -98,28 +194,66 @@ historical_limit_of(StkRange range)
   case STK_RANGE_1Y:
     return 400;
   default:
-    g_assert_not_reached();
+    g_return_val_if_reached(0);
   }
 }
 
+/**
+ * new_york_tz:
+ *
+ * Returns the America/New_York time zone, created on first use (falling back to a POSIX rule string
+ * if the tz database lacks the name).
+ *
+ * Preconditions:
+ *  - none.
+ * Postconditions:
+ *  - the zone is created at most once per process (GOnce) and is never freed. If neither identifier
+ *    can be resolved NULL is returned on every call; this replaces the former g_assert(tz != NULL)
+ *    and the only caller, parse_quote_timestamp(), then reports the timestamp as unparsable.
+ * Thread affinity: any thread (initialisation is serialised by g_once_init_enter(); the zone is
+ *   only read afterwards).
+ * Ownership: the returned GTimeZone is owned by this function (process lifetime); callers must not
+ *   unref it.
+ *
+ * Returns: the shared zone, or NULL if it cannot be created.
+ */
 static GTimeZone *
 new_york_tz(void)
 {
   static gsize tz_once = 0;
+  static GTimeZone *tz = NULL; /* written once, before g_once_init_leave() */
   if (g_once_init_enter(&tz_once)) {
-    GTimeZone *tz = g_time_zone_new_identifier("America/New_York");
+    tz = g_time_zone_new_identifier("America/New_York");
     if (tz == NULL)
       tz = g_time_zone_new_identifier("EST5EDT,M3.2.0,M11.1.0");
-    g_assert(tz != NULL);
-    g_once_init_leave(&tz_once, (gsize)tz);
+    g_once_init_leave(&tz_once, 1);
   }
-  return (GTimeZone *)tz_once;
+  return tz;
 }
 
 /* ------------------------------------------------------------------------ */
 /* URL builders                                                             */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * check_symbol_kind:
+ * @symbol: (nullable): candidate ticker
+ * @kind: candidate kind
+ * @error: (nullable): return location for a #GError
+ *
+ * Validates the symbol and kind of a request and reports STK_ERROR_INVALID_ARG for either.
+ *
+ * Preconditions:
+ *  - @symbol is NULL or NUL-terminated (stk_symbol_is_valid() bounds its reads to 16 bytes); @error
+ *    is NULL or points to a NULL GError*.
+ * Postconditions:
+ *  - on TRUE nothing is set; on FALSE *@error (when non-NULL) is a STK_ERROR /
+ *    STK_ERROR_INVALID_ARG error.
+ * Thread affinity: any thread (pure)
+ * Ownership: @symbol and @error stay with the caller; nothing is retained.
+ *
+ * Returns: TRUE if stk_symbol_is_valid(@symbol) and kind_is_valid(@kind), else FALSE.
+ */
 static gboolean
 check_symbol_kind(const char *symbol, StkKind kind, GError **error)
 {
@@ -134,7 +268,22 @@ check_symbol_kind(const char *symbol, StkKind kind, GError **error)
   return TRUE;
 }
 
-/* Upper-cases and percent-encodes an already validated symbol. */
+/**
+ * encode_symbol:
+ * @symbol: a symbol that satisfied stk_symbol_is_valid()
+ *
+ * Upper-cases and percent-encodes a validated symbol for use in a URL path.
+ *
+ * Preconditions:
+ *  - @symbol is non-NULL and NUL-terminated within 16 bytes: both callers invoke it only after
+ *    check_symbol_kind() succeeded on the same string.
+ * Postconditions:
+ *  - nothing is modified; the result contains only unreserved characters and %XX escapes.
+ * Thread affinity: any thread (pure)
+ * Ownership: @symbol stays with the caller; the returned string is new.
+ *
+ * Returns: (transfer full): the encoded symbol, to be released with g_free().
+ */
 static char *
 encode_symbol(const char *symbol)
 {
@@ -142,6 +291,7 @@ encode_symbol(const char *symbol)
   return g_uri_escape_string(upper, NULL, FALSE);
 }
 
+/* Documented in stk-nasdaq.h. */
 char *
 stk_nasdaq_quote_url(const char *base_url, const char *symbol, StkKind kind, GError **error)
 {
@@ -154,6 +304,22 @@ stk_nasdaq_quote_url(const char *base_url, const char *symbol, StkKind kind, GEr
                          assetclass_of(kind));
 }
 
+/**
+ * date_to_iso:
+ * @date: a valid GDate
+ *
+ * Formats a date as "YYYY-MM-DD".
+ *
+ * Preconditions:
+ *  - @date is non-NULL and g_date_valid(): stk_nasdaq_series_url() passes @today (checked valid and
+ *    inside the supported years) and a date derived from it by g_date_subtract_months().
+ * Postconditions:
+ *  - nothing is modified.
+ * Thread affinity: any thread (pure)
+ * Ownership: @date stays with the caller; the returned string is new.
+ *
+ * Returns: (transfer full): the ISO date string, to be released with g_free().
+ */
 static char *
 date_to_iso(const GDate *date)
 {
@@ -161,6 +327,7 @@ date_to_iso(const GDate *date)
                          (guint)g_date_get_month(date), (guint)g_date_get_day(date));
 }
 
+/* Documented in stk-nasdaq.h. */
 char *
 stk_nasdaq_series_url(const char *base_url, const char *symbol, StkKind kind, StkRange range,
                       const GDate *today, GError **error)
@@ -202,6 +369,7 @@ stk_nasdaq_series_url(const char *base_url, const char *symbol, StkKind kind, St
                          base_url, sym, asset, from_s, to_s);
 }
 
+/* Documented in stk-nasdaq.h. */
 char *
 stk_nasdaq_search_url(const char *base_url, const char *text, GError **error)
 {
@@ -213,9 +381,14 @@ stk_nasdaq_search_url(const char *base_url, const char *text, GError **error)
   }
   while (*text == ' ' || (*text >= '\t' && *text <= '\r'))
     text++;
-  gsize len = strlen(text);
-  while (len > 0 && (text[len - 1] == ' ' || (text[len - 1] >= '\t' && text[len - 1] <= '\r')))
-    len--;
+  /* One pass to the terminating NUL (a caller precondition) remembering the end of
+   * the last non-whitespace byte; it stops early once the trimmed text is already
+   * longer than the limit (rejected below either way). */
+  gsize len = 0;
+  for (gsize i = 0; text[i] != '\0' && len <= SEARCH_TEXT_MAX_BYTES; i++) {
+    if (!(text[i] == ' ' || (text[i] >= '\t' && text[i] <= '\r')))
+      len = i + 1;
+  }
   if (len == 0 || len > SEARCH_TEXT_MAX_BYTES || !g_utf8_validate(text, (gssize)len, NULL)) {
     g_set_error_literal(error, STK_ERROR, STK_ERROR_INVALID_ARG,
                         "search text must be 1-64 bytes of valid UTF-8");
@@ -238,6 +411,24 @@ stk_nasdaq_search_url(const char *base_url, const char *text, GError **error)
 /* JSON helpers (every accessor tolerates missing / null / mistyped nodes)  */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * member_object:
+ * @obj: a JsonObject
+ * @name: NUL-terminated member name
+ *
+ * Returns the member @name of @obj if it is a JSON object.
+ *
+ * Preconditions:
+ *  - @obj and @name are non-NULL; every call site passes an object it already obtained from the
+ *    parser tree or checked non-NULL.
+ * Postconditions:
+ *  - nothing is modified.
+ * Thread affinity: any thread (pure)
+ * Ownership: the result is borrowed from @obj (valid while the owning JsonParser lives).
+ *
+ * Returns: (nullable) (transfer none): the member object, or NULL if missing, null or of another
+ *   type.
+ */
 static JsonObject *
 member_object(JsonObject *obj, const char *name)
 {
@@ -245,6 +436,24 @@ member_object(JsonObject *obj, const char *name)
   return (node != NULL && JSON_NODE_HOLDS_OBJECT(node)) ? json_node_get_object(node) : NULL;
 }
 
+/**
+ * member_string:
+ * @obj: a JsonObject
+ * @name: NUL-terminated member name
+ *
+ * Returns the member @name of @obj if it is a JSON string.
+ *
+ * Preconditions:
+ *  - @obj and @name are non-NULL; every call site passes a non-NULL object (blocks are NULL-checked
+ *    before use).
+ * Postconditions:
+ *  - nothing is modified.
+ * Thread affinity: any thread (pure)
+ * Ownership: the result is borrowed from @obj (valid while the owning JsonParser lives).
+ *
+ * Returns: (nullable) (transfer none): the NUL-terminated string, or NULL if missing or not a
+ *   string. The text is external and its length is not bounded here.
+ */
 static const char *
 member_string(JsonObject *obj, const char *name)
 {
@@ -255,6 +464,22 @@ member_string(JsonObject *obj, const char *name)
   return json_node_get_string(node);
 }
 
+/**
+ * member_bool:
+ * @obj: a JsonObject
+ * @name: NUL-terminated member name
+ *
+ * Returns whether the member @name of @obj is the JSON boolean true.
+ *
+ * Preconditions:
+ *  - @obj and @name are non-NULL; every call site passes a non-NULL block.
+ * Postconditions:
+ *  - nothing is modified.
+ * Thread affinity: any thread (pure)
+ * Ownership: none retained.
+ *
+ * Returns: TRUE only for a boolean member that is true; FALSE if missing, null, mistyped or false.
+ */
 static gboolean
 member_bool(JsonObject *obj, const char *name)
 {
@@ -263,6 +488,23 @@ member_bool(JsonObject *obj, const char *name)
          json_node_get_value_type(node) == G_TYPE_BOOLEAN && json_node_get_boolean(node);
 }
 
+/**
+ * node_number:
+ * @node: (nullable): the node to read
+ * @out: (out): receives the value on success
+ *
+ * Reads a JSON integer or double node as a finite double.
+ *
+ * Preconditions:
+ *  - @out is non-NULL and writable.
+ * Postconditions:
+ *  - on TRUE *@out holds a finite value; on FALSE *@out is untouched. Integers are converted to
+ *    double by json_node_get_double() (no float-to-integer cast is involved).
+ * Thread affinity: any thread (pure)
+ * Ownership: nothing retained.
+ *
+ * Returns: TRUE if @node is an int64 or double value that is finite, else FALSE.
+ */
 static gboolean
 node_number(JsonNode *node, double *out)
 {
@@ -278,15 +520,82 @@ node_number(JsonNode *node, double *out)
   return TRUE;
 }
 
+/**
+ * member_number:
+ * @obj: a JsonObject
+ * @name: NUL-terminated member name
+ * @out: (out): receives the value on success
+ *
+ * Reads the member @name of @obj as a finite number (see node_number()).
+ *
+ * Preconditions:
+ *  - @obj, @name and @out are non-NULL; every call site passes a non-NULL object.
+ * Postconditions:
+ *  - as for node_number().
+ * Thread affinity: any thread (pure)
+ * Ownership: nothing retained.
+ *
+ * Returns: TRUE if the member is a finite JSON number, else FALSE.
+ */
 static gboolean
 member_number(JsonObject *obj, const char *name, double *out)
 {
   return node_number(json_object_get_member(obj, name), out);
 }
 
-/* Copy of the first @max_chars characters of the valid UTF-8 @text (all of it
- * if shorter), so a server message cannot bloat an error message or split a
- * UTF-8 sequence. The result is always NUL-terminated. */
+/**
+ * name_is_usable:
+ * @name: (nullable): NUL-terminated text from a JSON string
+ *
+ * Tells whether an external display name may be stored: non-empty, at most NAME_MAX_BYTES bytes,
+ * valid UTF-8 and free of control characters. It has the same semantics as the StkYahoo provider's
+ * name_is_usable(); the length is established with a bounded memchr().
+ *
+ * Preconditions:
+ *  - @name is NULL or NUL-terminated (JSON-parsed text); at most NAME_MAX_BYTES + 1 bytes are
+ *    examined for the terminator.
+ * Postconditions:
+ *  - nothing is modified. Callers store NULL instead of an unusable name (an empty quote name, or
+ *    "" for a search hit); this filtering is the behavior change approved for external company
+ *    names.
+ * Thread affinity: any thread (pure)
+ * Ownership: @name stays with the caller; nothing is retained.
+ *
+ * Returns: TRUE if @name is usable, FALSE for NULL, "", a name longer than NAME_MAX_BYTES, invalid
+ *   UTF-8 or a name containing a control character.
+ */
+static gboolean
+name_is_usable(const char *name)
+{
+  if (name == NULL || name[0] == '\0')
+    return FALSE;
+  const char *nul = memchr(name, '\0', NAME_MAX_BYTES + 1);
+  if (nul == NULL || !g_utf8_validate(name, (gssize)(nul - name), NULL))
+    return FALSE;
+  for (const char *p = name; p < nul; p = g_utf8_next_char(p))
+    if (g_unichar_iscntrl(g_utf8_get_char(p)))
+      return FALSE;
+  return TRUE;
+}
+
+/**
+ * truncated_copy:
+ * @text: valid UTF-8, NUL-terminated
+ * @max_chars: number of characters to keep; <= 0 yields "".
+ *
+ * Copies the first @max_chars characters of the valid UTF-8 @text (all of it if shorter), so a
+ * server message cannot bloat an error message or split a UTF-8 sequence.
+ *
+ * Preconditions:
+ *  - @text is non-NULL, NUL-terminated valid UTF-8: the only caller passes a JSON string of a body
+ *    that parse_envelope() validated with g_utf8_validate().
+ * Postconditions:
+ *  - the copy is always NUL-terminated and ends on a character boundary; @text is unchanged.
+ * Thread affinity: any thread (pure)
+ * Ownership: @text stays with the caller; the returned string is new.
+ *
+ * Returns: (transfer full): the prefix copy, to be released with g_free().
+ */
 static char *
 truncated_copy(const char *text, glong max_chars)
 {
@@ -296,9 +605,31 @@ truncated_copy(const char *text, glong max_chars)
   return g_strndup(text, (gsize)(end - text));
 }
 
-/*
- * Validates @data as a UTF-8 JSON envelope {"data":..., "status":{"rCode":N}}
- * and returns the parser (owner of *root). rCode != 200 is NOT_FOUND.
+/**
+ * parse_envelope:
+ * @data: (nullable): body bytes
+ * @len: number of readable bytes at @data
+ * @root: (out): receives the root object on success
+ * @error: (nullable): return location for a #GError
+ *
+ * Validates @data as a UTF-8 JSON envelope {"data":..., "status":{"rCode":N}} and returns the
+ * parser, the owner of *@root. rCode != 200 is STK_ERROR_NOT_FOUND; an embedded error message is
+ * truncated to 80 characters.
+ *
+ * Preconditions:
+ *  - @data is NULL only with @len == 0, otherwise it points to @len readable bytes (not necessarily
+ *    NUL-terminated: reads are bounded by @len).
+ *  - @root is non-NULL; @error is NULL or points to a NULL GError*.
+ * Postconditions:
+ *  - on success *@root is borrowed from the returned parser; on failure NULL is returned, *@root is
+ *    untouched and *@error (when non-NULL) is STK_ERROR_PARSE (empty, too large, non-UTF-8,
+ *    malformed, wrong shape) or STK_ERROR_NOT_FOUND (rCode != 200). @len above
+ *    STK_NASDAQ_MAX_BODY_BYTES is rejected before any parsing.
+ * Thread affinity: any thread (pure)
+ * Ownership: @data stays with the caller and is not retained (json-glib copies what it needs); the
+ *   parser is returned to the caller and *@root must not outlive it.
+ *
+ * Returns: (transfer full) (nullable): the parser, or NULL with @error set.
  */
 static JsonParser *
 parse_envelope(const guint8 *data, gsize len, JsonObject **root, GError **error)
@@ -356,7 +687,23 @@ parse_envelope(const guint8 *data, gsize len, JsonObject **root, GError **error)
   return g_steal_pointer(&parser);
 }
 
-/* Returns the envelope's "data" object or sets PARSE. */
+/**
+ * envelope_data_object:
+ * @root: the envelope root returned by parse_envelope()
+ * @error: (nullable): return location for a #GError
+ *
+ * Returns the envelope's "data" object or sets STK_ERROR_PARSE.
+ *
+ * Preconditions:
+ *  - @root is non-NULL (as filled in by parse_envelope()); @error is NULL or points to a NULL
+ *    GError*.
+ * Postconditions:
+ *  - on NULL, *@error (when non-NULL) is STK_ERROR_PARSE "response has no data object".
+ * Thread affinity: any thread (pure)
+ * Ownership: the result is borrowed from @root (valid while its parser lives).
+ *
+ * Returns: (nullable) (transfer none): the "data" object, or NULL with @error set.
+ */
 static JsonObject *
 envelope_data_object(JsonObject *root, GError **error)
 {
@@ -370,6 +717,27 @@ envelope_data_object(JsonObject *root, GError **error)
 /* Number / date parsing                                                    */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * scan_uint:
+ * @p: (inout): cursor into a NUL-terminated string
+ * @min_digits: minimum number of digits required
+ * @max_digits: maximum number of digits consumed; at most 9 so that the value cannot overflow a
+ *   guint (all call sites pass 2 or 4)
+ * @out: (out): receives the value on success
+ *
+ * Reads up to @max_digits ASCII digits at *@p as an unsigned decimal number and advances *@p past
+ * them.
+ *
+ * Preconditions:
+ *  - @p, *@p and @out are non-NULL and *@p is NUL-terminated (the scan stops at the first
+ *    non-digit, in particular at the NUL).
+ * Postconditions:
+ *  - *@p is advanced past the digits consumed even on failure; *@out is written only on TRUE.
+ * Thread affinity: any thread (pure)
+ * Ownership: the cursor points into a string owned by the caller; nothing is retained.
+ *
+ * Returns: TRUE if at least @min_digits digits were read, else FALSE.
+ */
 static gboolean
 scan_uint(const char **p, guint min_digits, guint max_digits, guint *out)
 {
@@ -385,6 +753,23 @@ scan_uint(const char **p, guint min_digits, guint max_digits, guint *out)
   return TRUE;
 }
 
+/**
+ * scan_char:
+ * @p: (inout): cursor into a NUL-terminated string
+ * @c: the expected non-NUL character
+ *
+ * Consumes the character @c at *@p.
+ *
+ * Preconditions:
+ *  - @p and *@p are non-NULL and *@p is NUL-terminated; @c is not NUL (all call sites pass a
+ *    literal punctuation character), so the cursor never moves past the NUL.
+ * Postconditions:
+ *  - *@p is advanced by one only when it matched.
+ * Thread affinity: any thread (pure)
+ * Ownership: the cursor points into a string owned by the caller; nothing is retained.
+ *
+ * Returns: TRUE if **@p == @c (and the cursor advanced), else FALSE.
+ */
 static gboolean
 scan_char(const char **p, char c)
 {
@@ -394,10 +779,26 @@ scan_char(const char **p, char c)
   return TRUE;
 }
 
-/*
- * Parses the timestamp strings of the /info endpoint:
- *   "Oct 8, 2026 7:25 PM ET", "Closed at Oct 8, 2026 4:00 PM ET", "Oct 8, 2026".
- * Times are America/New_York; a bare date is mapped to 12:00 that day.
+/**
+ * parse_quote_timestamp:
+ * @text: (nullable): NUL-terminated timestamp text
+ * @out_ms: (out): receives the Unix time in milliseconds on success
+ *
+ * Parses the timestamp strings of the /info endpoint: "Oct 8, 2026 7:25 PM ET", "Closed at Oct 8,
+ * 2026 4:00 PM ET" or "Oct 8, 2026". Times are America/New_York; a bare date is mapped to 12:00
+ * that day.
+ *
+ * Preconditions:
+ *  - @text is NULL or NUL-terminated (external JSON text; every comparison used stops at the first
+ *    mismatch or NUL); @out_ms is non-NULL.
+ * Postconditions:
+ *  - *@out_ms is written only on TRUE. FALSE is returned for NULL, any deviation from the formats,
+ *    an invalid calendar date, or when the New York time zone is unavailable (new_york_tz()
+ *    returned NULL). Digit groups have at most 4 digits, so no integer overflow occurs.
+ * Thread affinity: any thread (the shared time zone is read-only).
+ * Ownership: @text stays with the caller; nothing is retained.
+ *
+ * Returns: TRUE if the text was fully parsed and denotes a representable instant, else FALSE.
  */
 static gboolean
 parse_quote_timestamp(const char *text, gint64 *out_ms)
@@ -453,7 +854,10 @@ parse_quote_timestamp(const char *text, gint64 *out_ms)
   if (*p != '\0' || !g_date_valid_dmy((GDateDay)day, (GDateMonth)month, (GDateYear)year))
     return FALSE;
 
-  GDateTime *dt = g_date_time_new(new_york_tz(), (gint)year, (gint)month, (gint)day, (gint)hour,
+  GTimeZone *tz = new_york_tz();
+  if (tz == NULL)
+    return FALSE;
+  GDateTime *dt = g_date_time_new(tz, (gint)year, (gint)month, (gint)day, (gint)hour,
                                   (gint)minute, 0);
   if (dt == NULL)
     return FALSE;
@@ -462,7 +866,23 @@ parse_quote_timestamp(const char *text, gint64 *out_ms)
   return TRUE;
 }
 
-/* Parses "MM/DD/YYYY" into 00:00 UTC of that date, epoch ms. */
+/**
+ * parse_row_date:
+ * @text: (nullable): NUL-terminated date text
+ * @out_ms: (out): receives the epoch milliseconds on success
+ *
+ * Parses "MM/DD/YYYY" into 00:00 UTC of that date, as epoch milliseconds.
+ *
+ * Preconditions:
+ *  - @text is NULL or NUL-terminated; @out_ms is non-NULL.
+ * Postconditions:
+ *  - *@out_ms is written only on TRUE. FALSE is returned for NULL, text not exactly in the format,
+ *    an invalid date, or a date outside 2022-01-01..2100-12-31 (EPOCH_MIN_MS <= ms < EPOCH_MAX_MS).
+ * Thread affinity: any thread (pure)
+ * Ownership: @text stays with the caller; nothing is retained.
+ *
+ * Returns: TRUE if parsed and inside the accepted window, else FALSE.
+ */
 static gboolean
 parse_row_date(const char *text, gint64 *out_ms)
 {
@@ -489,11 +909,31 @@ parse_row_date(const char *text, gint64 *out_ms)
 /* Parsers                                                                  */
 /* ------------------------------------------------------------------------ */
 
-/*
- * Implementation of stk_nasdaq_parse_quote(). If @regular_block is not NULL
- * it is set to whether the price was taken from the regular-session block
- * (primaryData while open or after the nightly roll, else secondaryData)
- * rather than from the fallback block.
+/**
+ * parse_quote_impl:
+ * @data: (nullable): body bytes
+ * @len: number of readable bytes at @data
+ * @symbol: requested symbol
+ * @kind: requested kind
+ * @regular_block: (out) (optional): receives whether the regular-session block was used; untouched
+ *   on failure
+ * @error: (nullable): return location for a #GError
+ *
+ * Implementation of stk_nasdaq_parse_quote(). If @regular_block is not NULL it is set to whether
+ * the price was taken from the regular-session block (primaryData while open or after the nightly
+ * roll, else secondaryData) rather than from the fallback block. The company name is filtered with
+ * name_is_usable().
+ *
+ * Preconditions:
+ *  - as for stk_nasdaq_parse_quote(): @data is NULL only with @len == 0 or points to @len bytes;
+ *    @symbol is NULL or NUL-terminated; @error is NULL or points to a NULL GError*.
+ * Postconditions:
+ *  - as for stk_nasdaq_parse_quote(); *@regular_block is written only on the success paths that
+ *    reach the price selection.
+ * Thread affinity: any thread (pure)
+ * Ownership: nothing retained; the returned quote is new.
+ *
+ * Returns: (transfer full) (nullable): the quote, or NULL with @error set.
  */
 static StkQuote *
 parse_quote_impl(const guint8 *data, gsize len, const char *symbol, StkKind kind,
@@ -551,12 +991,16 @@ parse_quote_impl(const guint8 *data, gsize len, const char *symbol, StkKind kind
     *regular_block = block != NULL && block == candidates[0];
 
   const char *currency = block != NULL ? member_string(block, "currency") : NULL;
+  /* Left to right with short-circuit: no byte after the first non-matching one is read. */
   if (currency != NULL &&
-      !(strlen(currency) == 3 && g_ascii_isupper(currency[0]) && g_ascii_isupper(currency[1]) &&
-        g_ascii_isupper(currency[2])))
+      !(g_ascii_isupper(currency[0]) && g_ascii_isupper(currency[1]) &&
+        g_ascii_isupper(currency[2]) && currency[3] == '\0'))
     currency = NULL;
 
-  StkQuote *quote = stk_quote_new(symbol, member_string(info, "companyName"), kind, currency);
+  const char *name = member_string(info, "companyName");
+  if (!name_is_usable(name))
+    name = NULL;
+  StkQuote *quote = stk_quote_new(symbol, name, kind, currency);
   quote->price = price;
   quote->market_open = market_open;
   if (block != NULL) {
@@ -573,6 +1017,7 @@ parse_quote_impl(const guint8 *data, gsize len, const char *symbol, StkKind kind
   return quote;
 }
 
+/* Documented in stk-nasdaq.h. */
 StkQuote *
 stk_nasdaq_parse_quote(const guint8 *data, gsize len, const char *symbol, StkKind kind,
                        GError **error)
@@ -580,7 +1025,24 @@ stk_nasdaq_parse_quote(const guint8 *data, gsize len, const char *symbol, StkKin
   return parse_quote_impl(data, len, symbol, kind, NULL, error);
 }
 
-/* Returns data.chart as an array; *empty is set for an explicit JSON null. */
+/**
+ * chart_array:
+ * @info: the "data" object
+ * @empty: (out): set to whether "chart" is JSON null
+ * @error: (nullable): return location for a #GError
+ *
+ * Returns data.chart as an array; *@empty is set for an explicit JSON null.
+ *
+ * Preconditions:
+ *  - @info and @empty are non-NULL; @error is NULL or points to a NULL GError*.
+ * Postconditions:
+ *  - *@empty is always written. NULL with *@empty FALSE means an error: *@error (when non-NULL) is
+ *    STK_ERROR_PARSE "response has no chart array".
+ * Thread affinity: any thread (pure)
+ * Ownership: the array is borrowed from @info (valid while its parser lives).
+ *
+ * Returns: (nullable) (transfer none): the chart array, or NULL (empty chart or error, see @empty).
+ */
 static JsonArray *
 chart_array(JsonObject *info, gboolean *empty, GError **error)
 {
@@ -596,6 +1058,7 @@ chart_array(JsonObject *info, gboolean *empty, GError **error)
   return NULL;
 }
 
+/* Documented in stk-nasdaq.h. */
 StkSeries *
 stk_nasdaq_parse_chart(const guint8 *data, gsize len, StkRange range, GError **error)
 {
@@ -662,6 +1125,23 @@ stk_nasdaq_parse_chart(const guint8 *data, gsize len, StkRange range, GError **e
   return series;
 }
 
+/**
+ * compare_points:
+ * @a: (not nullable): const StkPoint *
+ * @b: (not nullable): const StkPoint *
+ *
+ * qsort-style comparison of two StkPoint by t_ms (ascending), written without subtraction so it
+ * cannot overflow.
+ *
+ * Preconditions:
+ *  - @a and @b point to valid StkPoint values (GArray elements passed by g_array_sort()).
+ * Postconditions:
+ *  - nothing is modified.
+ * Thread affinity: any thread (pure)
+ * Ownership: nothing retained.
+ *
+ * Returns: negative, zero or positive as @a->t_ms is before, equal to or after @b->t_ms.
+ */
 static int
 compare_points(gconstpointer a, gconstpointer b)
 {
@@ -669,6 +1149,7 @@ compare_points(gconstpointer a, gconstpointer b)
   return (pa->t_ms > pb->t_ms) - (pa->t_ms < pb->t_ms);
 }
 
+/* Documented in stk-nasdaq.h. */
 StkSeries *
 stk_nasdaq_parse_historical(const guint8 *data, gsize len, StkRange range, GError **error)
 {
@@ -721,6 +1202,7 @@ stk_nasdaq_parse_historical(const guint8 *data, gsize len, StkRange range, GErro
   return series;
 }
 
+/* Documented in stk-nasdaq.h. */
 GPtrArray *
 stk_nasdaq_parse_search(const guint8 *data, gsize len, GError **error)
 {
@@ -761,6 +1243,8 @@ stk_nasdaq_parse_search(const guint8 *data, gsize len, GError **error)
       continue;
 
     const char *name = member_string(item, "name");
+    if (!name_is_usable(name))
+      name = NULL;
     StkSearchHit *hit = g_new0(StkSearchHit, 1);
     hit->symbol = g_ascii_strup(symbol, -1);
     hit->name = g_strdup(name != NULL ? name : "");
@@ -774,6 +1258,11 @@ stk_nasdaq_parse_search(const guint8 *data, gsize len, GError **error)
 /* StkNasdaq object                                                         */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Instance data; main thread only. session and base_url are owned by the instance (released in
+ * dispose / finalize); inflight counts the live Ops, each of which holds a strong reference to
+ * the instance, so the instance is never finalised while inflight > 0.
+ */
 struct _StkNasdaq {
   GObject parent_instance;
   SoupSession *session; /* created once, shared by every request */
@@ -785,9 +1274,56 @@ struct _StkNasdaq {
 
 static void stk_nasdaq_provider_init(StkProviderInterface *iface);
 
+/*
+ * G_DEFINE_TYPE_WITH_CODE(StkNasdaq, stk_nasdaq, G_TYPE_OBJECT, G_IMPLEMENT_INTERFACE(
+ * STK_TYPE_PROVIDER, stk_nasdaq_provider_init)) generates the following (checked with gcc -E of
+ * this file with the project's compile flags):
+ *  - GType stk_nasdaq_get_type(void): returns the GType of StkNasdaq and registers it on the first
+ *    call, inside a once-initialisation guard, by calling stk_nasdaq_get_type_once().
+ *    Thread affinity: any thread. Ownership: none (no pointers).
+ *  - static GType stk_nasdaq_get_type_once(void): registers StkNasdaq as a static type derived
+ *    from G_TYPE_OBJECT (class structure StkNasdaqClass, instance structure StkNasdaq, class
+ *    initialiser stk_nasdaq_class_intern_init(), instance initialiser stk_nasdaq_init()). The
+ *    _WITH_CODE argument G_IMPLEMENT_INTERFACE() then adds the StkProvider interface to the new
+ *    type with g_type_add_interface_static(), using stk_nasdaq_provider_init() as the interface
+ *    initialiser (no interface data), and the new GType is returned.
+ *    Thread affinity: only via stk_nasdaq_get_type(). Ownership: none (no pointers).
+ *  - static void stk_nasdaq_class_intern_init(gpointer klass): @klass is the class structure
+ *    being initialised (borrowed, written; nothing is retained). It stores the parent class in
+ *    stk_nasdaq_parent_class, adjusts the private offset only if StkNasdaq_private_offset is
+ *    non-zero, then calls stk_nasdaq_class_init(). Called by GObject once per type, from the
+ *    thread that first uses the type. Ownership: @klass belongs to GObject.
+ *  - static gpointer stk_nasdaq_parent_class: NULL until class_intern_init() runs; used by
+ *    dispose() and finalize() to chain up.
+ *  - static gint StkNasdaq_private_offset: stays 0 (no G_ADD_PRIVATE is used).
+ *  - static inline gpointer stk_nasdaq_get_instance_private(StkNasdaq *self): returns self plus
+ *    the private offset; unused here (G_GNUC_UNUSED). @self is borrowed. Thread affinity: any
+ *    thread.
+ * The interface initialiser stk_nasdaq_provider_init(StkProviderInterface *iface) is not
+ * generated; it is the function named in the _WITH_CODE argument and is defined below. GObject
+ * calls it with the interface structure of StkNasdaq (@iface is borrowed, written, nothing is
+ * retained; owned by GObject) when the interface is set up for the type, and it stores the six
+ * nasdaq_*_async / nasdaq_*_finish implementations in the vtable.
+ */
 G_DEFINE_TYPE_WITH_CODE(StkNasdaq, stk_nasdaq, G_TYPE_OBJECT,
                         G_IMPLEMENT_INTERFACE(STK_TYPE_PROVIDER, stk_nasdaq_provider_init))
 
+/**
+ * stk_nasdaq_init:
+ * @self: (not nullable): the new instance
+ *
+ * GObject instance initialiser: creates the shared HTTP session and sets the production defaults.
+ * No cookie jar and no HTTP cache feature are added: nothing is persisted.
+ *
+ * Preconditions:
+ *  - @self is a zero-initialised StkNasdaq instance being constructed by GObject.
+ * Postconditions:
+ *  - @self->session is a new SoupSession with the app user agent; base_url, timeout_ms and
+ *    backoff_base_ms hold the STK_NASDAQ_* defaults; inflight is 0.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @self owns the session and the base_url copy; they are released by dispose and
+ *   finalize.
+ */
 static void
 stk_nasdaq_init(StkNasdaq *self)
 {
@@ -798,6 +1334,21 @@ stk_nasdaq_init(StkNasdaq *self)
   self->backoff_base_ms = STK_NASDAQ_BACKOFF_BASE_MS;
 }
 
+/**
+ * stk_nasdaq_dispose:
+ * @object: (not nullable): the StkNasdaq being disposed
+ *
+ * GObject dispose: drops the HTTP session. Pending operations hold their own reference to the
+ * instance (see Op.owner), so dispose cannot run while one is outstanding.
+ *
+ * Preconditions:
+ *  - @object is a StkNasdaq; may run more than once (g_clear_object() makes that safe).
+ * Postconditions:
+ *  - @self->session is NULL; the parent dispose has run.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the session reference owned by the instance is released; @object stays with the
+ *   caller.
+ */
 static void
 stk_nasdaq_dispose(GObject *object)
 {
@@ -806,6 +1357,19 @@ stk_nasdaq_dispose(GObject *object)
   G_OBJECT_CLASS(stk_nasdaq_parent_class)->dispose(object);
 }
 
+/**
+ * stk_nasdaq_finalize:
+ * @object: (not nullable): the StkNasdaq being finalized
+ *
+ * GObject finalize: frees the base URL copy.
+ *
+ * Preconditions:
+ *  - @object is a StkNasdaq whose last reference is gone (runs once).
+ * Postconditions:
+ *  - base_url is freed; the parent finalize has run.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the instance owns base_url; it is freed here.
+ */
 static void
 stk_nasdaq_finalize(GObject *object)
 {
@@ -814,6 +1378,19 @@ stk_nasdaq_finalize(GObject *object)
   G_OBJECT_CLASS(stk_nasdaq_parent_class)->finalize(object);
 }
 
+/**
+ * stk_nasdaq_class_init:
+ * @klass: (not nullable): the class structure being initialised
+ *
+ * GObject class initialiser: installs dispose and finalize.
+ *
+ * Preconditions:
+ *  - called once by the GType system.
+ * Postconditions:
+ *  - dispose and finalize are overridden; no properties or signals exist.
+ * Thread affinity: any thread (called by GObject under its type lock).
+ * Ownership: @klass is owned by the type system and not retained.
+ */
 static void
 stk_nasdaq_class_init(StkNasdaqClass *klass)
 {
@@ -822,13 +1399,35 @@ stk_nasdaq_class_init(StkNasdaqClass *klass)
   object_class->finalize = stk_nasdaq_finalize;
 }
 
+/* Documented in stk-nasdaq.h. */
 StkNasdaq *
 stk_nasdaq_new(void)
 {
   return g_object_new(STK_TYPE_NASDAQ, NULL);
 }
 
-/* Returns a normalised copy of @base_url if it is an acceptable origin. */
+/**
+ * validate_base_url:
+ * @base_url: NUL-terminated URL text
+ *
+ * Returns a normalised copy of @base_url if it is an acceptable origin (see
+ * stk_nasdaq_new_custom()).
+ *
+ * Preconditions:
+ *  - @base_url is non-NULL and NUL-terminated (the caller, stk_nasdaq_new_custom(), checks
+ *    non-NULL; g_uri_parse() relies on the terminator as well). The parsed GUri accessors are
+ *    compared with g_str_equal(): for a successfully parsed URI the scheme and path are non-NULL
+ *    and the host is checked for NULL first.
+ * Postconditions:
+ *  - @base_url is unchanged. The copy is made with g_strdup() and its length measured with strlen()
+ *    on that GLib-created copy; one trailing "/" is removed. NULL is returned for an unparsable
+ *    URL, a missing/empty host, userinfo, query, fragment, a path other than "" or "/", a scheme
+ *    other than https, or http to a non-loopback host.
+ * Thread affinity: any thread (pure)
+ * Ownership: @base_url stays with the caller.
+ *
+ * Returns: (transfer full) (nullable): the normalised origin, or NULL if not acceptable.
+ */
 static char *
 validate_base_url(const char *base_url)
 {
@@ -840,25 +1439,27 @@ validate_base_url(const char *base_url)
   const char *path = g_uri_get_path(uri);
   if (host == NULL || *host == '\0' || g_uri_get_userinfo(uri) != NULL ||
       g_uri_get_query(uri) != NULL || g_uri_get_fragment(uri) != NULL ||
-      !(path[0] == '\0' || strcmp(path, "/") == 0))
+      !(path[0] == '\0' || g_str_equal(path, "/")))
     return NULL;
-  gboolean loopback = strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0 ||
-                      strcmp(host, "localhost") == 0;
-  if (!(strcmp(scheme, "https") == 0 || (strcmp(scheme, "http") == 0 && loopback)))
+  gboolean loopback = g_str_equal(host, "127.0.0.1") || g_str_equal(host, "::1") ||
+                      g_str_equal(host, "localhost");
+  if (!(g_str_equal(scheme, "https") || (g_str_equal(scheme, "http") && loopback)))
     return NULL;
 
-  gsize len = strlen(base_url);
-  if (len > 0 && base_url[len - 1] == '/')
-    len--;
-  return g_strndup(base_url, len);
+  char *normalised = g_strdup(base_url);
+  gsize len = strlen(normalised); /* GLib-created copy: NUL-terminated */
+  if (len > 0 && normalised[len - 1] == '/')
+    normalised[len - 1] = '\0';
+  return normalised;
 }
 
+/* Documented in stk-nasdaq.h. */
 StkNasdaq *
 stk_nasdaq_new_custom(const char *base_url, guint timeout_ms, guint backoff_base_ms)
 {
   g_return_val_if_fail(base_url != NULL, NULL);
   g_return_val_if_fail(timeout_ms >= 1 && timeout_ms <= 600000, NULL);
-  g_return_val_if_fail(backoff_base_ms <= 600000, NULL);
+  g_return_val_if_fail(backoff_base_ms <= BACKOFF_BASE_MAX_MS, NULL);
   char *normalised = validate_base_url(base_url);
   if (normalised == NULL)
     return NULL;
@@ -878,7 +1479,24 @@ stk_nasdaq_new_custom(const char *base_url, guint timeout_ms, guint backoff_base
  * (a heap double, NAN when unknown), see stk-nasdaq.h. */
 typedef enum { OP_QUOTE, OP_PREV_CLOSE, OP_SERIES, OP_SEARCH } OpType;
 
-/* Task data of one operation: what to parse and the state of the request. */
+/*
+ * Task data of one operation: what to parse and the state of the request. Created by
+ * op_new(), owned by the GTask (task data, freed by op_free() when the task is finalised) and
+ * used from the main thread only.
+ *
+ * Ownership of the members: url, symbol, user_cancellable (a strong reference) and owner (a
+ * strong reference; the Op counts in owner->inflight from op_new() to op_free()) are owned by
+ * the Op. The per-attempt members are owned by the Op between attempt_start() and
+ * attempt_cleanup(); the back-off sources between schedule_retry() and backoff_cleanup().
+ *
+ * Lifetime: every GSource and GAsyncReadyCallback of an operation holds its own reference to
+ * the GTask as callback data (released when the callback has run or the source is finalised;
+ * the user-cancel handler holds the attempt cancellable instead), so the task, and with it the
+ * Op, outlives every pending callback.
+ * That cycle (task -> Op -> source -> task) is broken by attempt_cleanup() and
+ * backoff_cleanup(), which every path that ends an attempt or a wait runs before the task is
+ * completed or retried.
+ */
 typedef struct {
   OpType type;
   char *url;
@@ -893,22 +1511,46 @@ typedef struct {
 
   /* Per-attempt state, released by attempt_cleanup(). */
   SoupMessage *msg;
-  GCancellable *attempt_cancel; /* cancelled by the deadline or by the user */
+  GCancellable *attempt_cancel; /* cancelled by the deadline or by the user; the user_cancellable
+                                 * handler holds a second reference as its data */
   gulong user_cancel_id;        /* handler on user_cancellable, 0 if none */
-  GSource *deadline;
+  GSource *deadline;            /* owned reference; its callback data is a task reference */
   gboolean timed_out;
   GInputStream *stream;
-  GByteArray *body;
-  gsize body_filled; /* bytes of body->data already read */
+  GByteArray *body;  /* owned until moved into the GBytes handed to op_complete() */
+  gsize body_filled; /* bytes of body->data already read; <= STK_NASDAQ_MAX_BODY_BYTES + 1 */
   goffset declared;  /* Content-Length of an undecoded body, else -1 */
 
   /* Back-off wait state, released by backoff_cleanup(). */
-  GSource *backoff_timer;
-  GSource *backoff_cancel;
+  GSource *backoff_timer;  /* owned reference; its callback data is a task reference */
+  GSource *backoff_cancel; /* owned reference (nullable); callback data is a task reference */
 } Op;
 
 static char tag_quote, tag_series, tag_search;
 
+/**
+ * attempt_cleanup:
+ * @op: (not nullable): the operation
+ *
+ * Releases the per-attempt state of @op: the deadline source, the user-cancellation handler, the
+ * attempt cancellable, the stream (closed asynchronously, which hands the connection back to the
+ * pool), the message and the partial body.
+ *
+ * Preconditions:
+ *  - @op is live (owned by its GTask). It may be called with no attempt running (everything NULL/0)
+ *    and more than once.
+ *  - It is not called from inside on_user_cancelled() (g_cancellable_disconnect() would wait for
+ *    that handler): its callers are fail_attempt(), on_read() and op_free(), reached from I/O
+ *    callbacks and from task finalisation. This relies on a cancelled read/send being completed
+ *    from the main loop and not from inside g_cancellable_cancel(): the pre-existing design,
+ *    exercised by the cancel tests, not something checked here.
+ * Postconditions:
+ *  - deadline, user_cancel_id, attempt_cancel, stream, msg and body are NULL/0 and body_filled is
+ *    0. Dropping the deadline source also drops the task reference held by its callback data, and
+ *    disconnecting the handler drops the attempt_cancel reference held by it.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @op stays with its task; every per-attempt resource owned by @op is released here.
+ */
 static void
 attempt_cleanup(Op *op)
 {
@@ -931,6 +1573,20 @@ attempt_cleanup(Op *op)
   op->body_filled = 0;
 }
 
+/**
+ * backoff_cleanup:
+ * @op: (not nullable): the operation
+ *
+ * Cancels and releases the back-off wait of @op (the timer and the cancellation watch). Dropping
+ * each source also drops the task reference held by its callback data.
+ *
+ * Preconditions:
+ *  - @op is live (owned by its GTask); may be called with no wait pending and more than once.
+ * Postconditions:
+ *  - backoff_timer and backoff_cancel are NULL and their sources are destroyed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @op stays with its task; the two source references owned by @op are released.
+ */
 static void
 backoff_cleanup(Op *op)
 {
@@ -944,6 +1600,25 @@ backoff_cleanup(Op *op)
   }
 }
 
+/**
+ * op_free:
+ * @data: (not nullable): the Op created by op_new()
+ *
+ * GDestroyNotify of the task data: releases an Op and everything it owns, then drops the in-flight
+ * count and the owner reference.
+ *
+ * Preconditions:
+ *  - @data is the Op installed with g_task_set_task_data(); called exactly once, when the GTask is
+ *    finalised (so no source or callback can still reference the task, because each of them holds a
+ *    task reference that attempt_cleanup()/backoff_cleanup() release first).
+ *  - op->owner->inflight is > 0: op_new() incremented it once for this Op.
+ * Postconditions:
+ *  - all members are released; owner->inflight is decremented once; the owner reference taken in
+ *    op_new() is dropped (which may finalise the provider). @data is invalid afterwards.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @data and of every member of the Op (url, symbol, user_cancellable
+ *   ref, owner ref, per-attempt and back-off state).
+ */
 static void
 op_free(gpointer data)
 {
@@ -958,25 +1633,84 @@ op_free(gpointer data)
   g_free(op);
 }
 
+/**
+ * quote_destroy:
+ * @quote: (nullable): a StkQuote returned by the parser
+ *
+ * GDestroyNotify for a StkQuote handed to g_task_return_pointer().
+ *
+ * Preconditions:
+ *  - @quote is NULL or a quote owned by the GTask result.
+ * Postconditions:
+ *  - the quote is freed with stk_quote_free().
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @quote.
+ */
 static void
 quote_destroy(gpointer quote)
 {
   stk_quote_free(quote);
 }
 
+/**
+ * series_destroy:
+ * @series: (nullable): a StkSeries returned by a parser
+ *
+ * GDestroyNotify for a StkSeries handed to g_task_return_pointer().
+ *
+ * Preconditions:
+ *  - @series is NULL or a series reference owned by the GTask result.
+ * Postconditions:
+ *  - the reference is dropped with stk_series_unref().
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of one reference to @series.
+ */
 static void
 series_destroy(gpointer series)
 {
   stk_series_unref(series);
 }
 
+/**
+ * hits_destroy:
+ * @hits: (not nullable): a GPtrArray returned by stk_nasdaq_parse_search()
+ *
+ * GDestroyNotify for the hit array handed to g_task_return_pointer().
+ *
+ * Preconditions:
+ *  - @hits is a non-NULL array owned by the GTask result.
+ * Postconditions:
+ *  - the array and its hits are freed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of one reference to @hits.
+ */
 static void
 hits_destroy(gpointer hits)
 {
   g_ptr_array_unref(hits);
 }
 
-/* Parses the finished body and completes @task with the result. */
+/**
+ * op_complete:
+ * @task: (not nullable): the operation's task; its task data is an Op
+ * @body: (not nullable): the complete response body
+ *
+ * Parses the finished body and completes @task with the result (or the parse error).
+ *
+ * Preconditions:
+ *  - @task has an Op as task data that has not been returned yet; @body is a GBytes of at most
+ *    STK_NASDAQ_MAX_BODY_BYTES bytes (on_read() fails the attempt instead of completing when the
+ *    body exceeds the cap; parse_envelope() re-checks the length).
+ * Postconditions:
+ *  - @task is completed exactly once: with a quote (OP_QUOTE), a heap double holding the previous
+ *    close or NAN (OP_PREV_CLOSE, only the regular-session block counts), a series (OP_SERIES: fund
+ *    historical or stock/ETF chart) or a hit array (OP_SEARCH); or with the parser's error. An
+ *    unknown op->type (cannot happen: the type is set by op_new() from the OpType enumeration)
+ *    completes the task with STK_ERROR_INVALID_ARG instead of aborting.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @task and @body stay with the caller; the result is handed to @task, which owns it
+ *   until the caller propagates it.
+ */
 static void
 op_complete(GTask *task, GBytes *body)
 {
@@ -1024,12 +1758,30 @@ op_complete(GTask *task, GBytes *body)
     break;
   }
   default:
-    g_assert_not_reached();
+    g_set_error_literal(&error, STK_ERROR, STK_ERROR_INVALID_ARG, "unknown operation type");
+    break;
   }
   if (error != NULL)
     g_task_return_error(task, error);
 }
 
+/**
+ * http_status_error:
+ * @status: HTTP status code of a non-2xx response
+ *
+ * Maps an HTTP status to the error reported to the caller: 429 is STK_ERROR_RATE_LIMITED, 400 and
+ * 404 are STK_ERROR_NOT_FOUND, everything else STK_ERROR_HTTP. The message formats are fixed; only
+ * the numeric status and libsoup's own phrase are embedded.
+ *
+ * Preconditions:
+ *  - none (any value is accepted).
+ * Postconditions:
+ *  - a new GError is returned; nothing else changes.
+ * Thread affinity: any thread (pure)
+ * Ownership: the returned error is owned by the caller.
+ *
+ * Returns: (transfer full): the error.
+ */
 static GError *
 http_status_error(guint status)
 {
@@ -1041,8 +1793,25 @@ http_status_error(guint status)
                      soup_status_get_phrase(status));
 }
 
-/* Turns a libsoup/GIO failure of the current attempt into the error the
- * caller sees. Takes ownership of @err. */
+/**
+ * normalize_error:
+ * @op: (not nullable): the operation
+ * @err: (transfer full): the failure of the attempt
+ *
+ * Turns a libsoup/GIO failure of the current attempt into the error the caller sees: cancellation
+ * of the user's cancellable wins, STK_ERROR errors pass through, timeouts become STK_ERROR_TIMEOUT,
+ * anything else STK_ERROR_NETWORK ("network error: %s" with the library's message; the format is
+ * fixed).
+ *
+ * Preconditions:
+ *  - @op is live; @err is non-NULL and owned by the caller, who must not use it afterwards.
+ * Postconditions:
+ *  - @err is either returned (STK_ERROR domain) or freed; the result is never NULL.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @err; the returned error is owned by the caller.
+ *
+ * Returns: (transfer full): the normalised error.
+ */
 static GError *
 normalize_error(Op *op, GError *err)
 {
@@ -1061,11 +1830,27 @@ normalize_error(Op *op, GError *err)
   return out;
 }
 
-static void
-schedule_retry(GTask *task);
+/* Forward declaration; documented at the definition below. */
+static void schedule_retry(GTask *task);
 
-/* Ends the current attempt with @err: retries after a back-off when the
- * failure class allows it, otherwise completes @task with the error. */
+/**
+ * fail_attempt:
+ * @task: (not nullable): the operation's task
+ * @err: (transfer full): the failure of the attempt
+ *
+ * Ends the current attempt with @err: retries after a back-off when the failure class allows it
+ * (network, timeout, HTTP 5xx, fewer than STK_NASDAQ_MAX_RETRIES retries so far), otherwise
+ * completes @task with the error.
+ *
+ * Preconditions:
+ *  - @task has an Op as task data and the caller holds a reference to @task for the duration of the
+ *    call (so op stays valid even if the task completes synchronously); @err is non-NULL.
+ * Postconditions:
+ *  - the attempt state is released; either schedule_retry() has queued the next attempt or @task
+ *    has been completed with the normalised error.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @err; @task stays with the caller.
+ */
 static void
 fail_attempt(GTask *task, GError *err)
 {
@@ -1084,6 +1869,24 @@ fail_attempt(GTask *task, GError *err)
   }
 }
 
+/**
+ * on_user_cancelled:
+ * @user: (unused): the caller's cancellable
+ * @attempt_cancel: (not nullable): the attempt's GCancellable (a GCancellable, passed as gpointer)
+ *
+ * "cancelled" handler of the caller's GCancellable: cancels the current attempt. It may run in
+ * whatever thread cancels the caller's cancellable (g_cancellable_cancel() is thread-safe).
+ *
+ * Preconditions:
+ *  - @attempt_cancel is the reference taken in attempt_start() and owned by the connection; the
+ *    handler is disconnected by attempt_cleanup() before the attempt's own reference is dropped,
+ *    and the connection's reference keeps the object alive until the notify runs.
+ * Postconditions:
+ *  - the attempt cancellable is cancelled; the pending I/O callback then reports the cancellation.
+ * Thread affinity: any thread (the one that cancels the caller's cancellable); it only calls
+ *   g_cancellable_cancel(), which is thread-safe.
+ * Ownership: @attempt_cancel stays owned by the connection; @user is not retained.
+ */
 static void
 on_user_cancelled(GCancellable *user, gpointer attempt_cancel)
 {
@@ -1091,6 +1894,26 @@ on_user_cancelled(GCancellable *user, gpointer attempt_cancel)
   g_cancellable_cancel(G_CANCELLABLE(attempt_cancel));
 }
 
+/**
+ * on_deadline:
+ * @user_data: (not nullable): the operation's GTask (a GTask, passed as gpointer)
+ *
+ * GSource callback of the per-attempt deadline: marks the attempt as timed out and cancels its I/O
+ * (the pending I/O callback reports the failure).
+ *
+ * Preconditions:
+ *  - @user_data is the task reference held by the source's callback data, so the task and its Op
+ *    are alive. attempt_cancel is non-NULL while the source is attached, because attempt_cleanup()
+ *    destroys the source before it clears attempt_cancel (g_cancellable_cancel(NULL) would be a
+ *    no-op anyway).
+ * Postconditions:
+ *  - op->timed_out is TRUE and the attempt cancellable is cancelled; the source is removed (and
+ *    releases its task reference).
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @user_data stays owned by the source (released by its destroy notify).
+ *
+ * Returns: G_SOURCE_REMOVE.
+ */
 static gboolean
 on_deadline(gpointer user_data)
 {
@@ -1101,9 +1924,32 @@ on_deadline(gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
-static void
-read_next(GTask *task);
+/* Forward declaration; documented at the definition below. */
+static void read_next(GTask *task);
 
+/**
+ * on_read:
+ * @source: (not nullable): the response GInputStream (a GObject, passed as GObject*)
+ * @result: (not nullable): the read result
+ * @user_data: (transfer full): the operation's GTask reference taken in read_next(), released here
+ *
+ * GAsyncReadyCallback of one body read: accumulates the bytes, enforces the body cap and the
+ * declared length, and either reads on, fails the attempt or hands the body to op_complete().
+ *
+ * Preconditions:
+ *  - @source is op->stream and @result belongs to the read started by read_next(), whose buffer
+ *    lies inside op->body (not reallocated while a read is pending). op->body_filled <=
+ *    STK_NASDAQ_MAX_BODY_BYTES on entry (read_next() is only called then).
+ * Postconditions:
+ *  - body_filled is incremented by the bytes read; if it exceeds STK_NASDAQ_MAX_BODY_BYTES the
+ *    attempt fails with STK_ERROR_PARSE "response too large" (so body_filled <= cap + 1 and (guint)
+ *    casts of it cannot truncate); a declared Content-Length that disagrees with the body is
+ *    STK_ERROR_NETWORK; at end of stream the body (trimmed to body_filled, <= the cap) is passed to
+ *    op_complete(). Exactly one of: another read, a failed attempt, or completion.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the task reference in @user_data is released on every path through the g_autoptr; the
+ *   body is stolen into a GBytes that is released here.
+ */
 static void
 on_read(GObject *source, GAsyncResult *result, gpointer user_data)
 {
@@ -1139,6 +1985,24 @@ on_read(GObject *source, GAsyncResult *result, gpointer user_data)
   g_bytes_unref(body);
 }
 
+/**
+ * read_next:
+ * @task: (not nullable): the operation's task
+ *
+ * Issues the next asynchronous read into the body buffer. It never asks for more than one byte
+ * beyond the cap, so an oversized body is detected without buffering it.
+ *
+ * Preconditions:
+ *  - @task has an Op with a live stream and body, and op->body_filled <= STK_NASDAQ_MAX_BODY_BYTES
+ *    (on_sent() starts with 0; on_read() checks the cap before calling), so the chunk is >= 1 byte
+ *    and body_filled + chunk <= cap + 1, which fits a guint (G_STATIC_ASSERT above).
+ * Postconditions:
+ *  - op->body is grown to body_filled + chunk bytes and a read of @chunk bytes is pending with a
+ *    new reference to @task, passed to on_read().
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @task stays with the caller; the pending read owns the new task reference until
+ *   on_read() releases it.
+ */
 static void
 read_next(GTask *task)
 {
@@ -1152,6 +2016,29 @@ read_next(GTask *task)
                             g_object_ref(task));
 }
 
+/**
+ * on_sent:
+ * @source: (not nullable): the SoupSession (a GObject, passed as GObject*)
+ * @result: (not nullable): the send result
+ * @user_data: (transfer full): the operation's GTask reference taken in attempt_start(), released
+ *   here
+ *
+ * GAsyncReadyCallback of soup_session_send_async(): checks the status and the declared length, then
+ * starts reading the body.
+ *
+ * Preconditions:
+ *  - @user_data is a task whose Op has a live message (op->msg) of the attempt that was sent.
+ * Postconditions:
+ *  - on a transport error or a non-2xx status the attempt fails (fail_attempt()); a declared
+ *    Content-Length above STK_NASDAQ_MAX_BODY_BYTES fails with STK_ERROR_PARSE "response too large"
+ *    before any body byte is read. Otherwise op->stream holds the stream, op->declared is the
+ *    Content-Length when no content coding applies (else -1), op->body is allocated with the
+ *    declared length (<= the cap, so the (guint) cast is safe) or READ_CHUNK_BYTES, and the first
+ *    read is issued.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the stream returned by libsoup becomes owned by the Op; the task reference in
+ *   @user_data is released on every path.
+ */
 static void
 on_sent(GObject *source, GAsyncResult *result, gpointer user_data)
 {
@@ -1186,6 +2073,25 @@ on_sent(GObject *source, GAsyncResult *result, gpointer user_data)
   read_next(task);
 }
 
+/**
+ * attempt_start:
+ * @task: (not nullable): the operation's task
+ *
+ * Starts one attempt of the operation: builds the GET message (no redirects), arms the deadline and
+ * the cancellation link and sends it.
+ *
+ * Preconditions:
+ *  - @task has an Op with url set and no attempt state; the caller holds a reference to @task for
+ *    the duration of the call; the source object of @task is the StkNasdaq.
+ * Postconditions:
+ *  - on a malformed URL the task is completed with STK_ERROR_INVALID_ARG and nothing is armed.
+ *    Otherwise msg, attempt_cancel, deadline (attached to the task's context), and, when the caller
+ *    supplied a cancellable, the user_cancel_id handler exist, and a send is pending; the
+ *    references taken for the callbacks are listed in Op.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @task stays with the caller; the new GSource and callbacks take their own task
+ *   references; @op owns the new per-attempt objects.
+ */
 static void
 attempt_start(GTask *task)
 {
@@ -1217,6 +2123,24 @@ attempt_start(GTask *task)
                           g_object_ref(task));
 }
 
+/**
+ * on_backoff_elapsed:
+ * @user_data: (not nullable): the operation's GTask (a GTask, passed as gpointer)
+ *
+ * GSource callback of the back-off timer: starts the next attempt.
+ *
+ * Preconditions:
+ *  - @user_data is the task reference owned by the timer source's callback data.
+ * Postconditions:
+ *  - the back-off sources are released and attempt_start() has run; the source is removed. A local
+ *    reference keeps the task alive across backoff_cleanup() (which drops the source's own
+ *    reference).
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @user_data stays owned by the source; the callback takes and releases its own
+ *   reference.
+ *
+ * Returns: G_SOURCE_REMOVE.
+ */
 static gboolean
 on_backoff_elapsed(gpointer user_data)
 {
@@ -1226,6 +2150,27 @@ on_backoff_elapsed(gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+/**
+ * on_backoff_cancelled:
+ * @user: (unused): the caller's cancellable
+ * @user_data: (not nullable): the operation's GTask (a GTask, passed as gpointer)
+ *
+ * GCancellableSource callback: the caller cancelled during the back-off wait, so the task completes
+ * immediately with G_IO_ERROR_CANCELLED.
+ *
+ * Preconditions:
+ *  - @user_data is the task reference owned by the cancellation source's callback data; a back-off
+ *    is pending.
+ * Postconditions:
+ *  - the back-off sources are released and @task is completed with a G_IO_ERROR /
+ *    G_IO_ERROR_CANCELLED error; the source is removed. A local reference keeps the task alive
+ *    across backoff_cleanup().
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @user_data stays owned by the source; the callback takes and releases its own
+ *   reference.
+ *
+ * Returns: G_SOURCE_REMOVE.
+ */
 static gboolean
 on_backoff_cancelled(GCancellable *user, gpointer user_data)
 {
@@ -1237,8 +2182,25 @@ on_backoff_cancelled(GCancellable *user, gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
-/* Waits backoff_base_ms * 2^(retries so far), then starts the next attempt;
- * a cancellation during the wait completes the task immediately. */
+/**
+ * schedule_retry:
+ * @task: (not nullable): the operation's task
+ *
+ * Waits backoff_base_ms * 2^(retries so far), then starts the next attempt; a cancellation during
+ * the wait completes the task immediately.
+ *
+ * Preconditions:
+ *  - @task has an Op whose attempt state was released and op->attempt < STK_NASDAQ_MAX_RETRIES
+ *    (fail_attempt() checks it), so the shift is at most STK_NASDAQ_MAX_RETRIES - 1 and
+ *    backoff_base_ms <= BACKOFF_BASE_MAX_MS (stk_nasdaq_new_custom() enforces it), hence the delay
+ *    fits a guint (G_STATIC_ASSERT above).
+ * Postconditions:
+ *  - op->attempt is incremented; a timer source (and, if the caller supplied a cancellable, a
+ *    cancellation source) is attached to the task's context, each holding a new task reference
+ *    released when the source is finalised.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @task stays with the caller; @op owns the two new sources.
+ */
 static void
 schedule_retry(GTask *task)
 {
@@ -1262,6 +2224,30 @@ schedule_retry(GTask *task)
 /* StkProvider glue                                                         */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * op_new:
+ * @owner: (not nullable): the provider
+ * @type: what to parse
+ * @url: (transfer full): the request URL
+ * @symbol: (nullable): requested symbol (quote operations); copied
+ * @kind: requested kind
+ * @range: requested range
+ * @user_cancellable: (nullable): the caller's cancellable; referenced
+ *
+ * Creates the Op of one request and counts it in the owner's in-flight total.
+ *
+ * Preconditions:
+ *  - @owner satisfies STK_IS_NASDAQ(); @url is non-NULL and heap-allocated (taken); @symbol is NULL
+ *    or NUL-terminated.
+ * Postconditions:
+ *  - owner->inflight is incremented (admit() has checked the cap); the Op holds a reference to
+ *    @owner and to @user_cancellable and owns @url and the symbol copy.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @url; copies @symbol; takes references on @owner and
+ *   @user_cancellable; the returned Op is owned by the caller (op_start() hands it to the task).
+ *
+ * Returns: (transfer full): the new Op.
+ */
 static Op *
 op_new(StkNasdaq *owner, OpType type, char *url, const char *symbol, StkKind kind, StkRange range,
        GCancellable *user_cancellable)
@@ -1278,12 +2264,31 @@ op_new(StkNasdaq *owner, OpType type, char *url, const char *symbol, StkKind kin
   return op;
 }
 
-/*
- * Admission control for an operation of @requests GETs. Returns TRUE if it
- * may start. Otherwise @task is completed with the error (@url_error for a
- * rejected argument, taken, when @url is NULL; STK_ERROR_RATE_LIMITED when
- * the in-flight cap would be exceeded), @url (taken) is freed, no network
- * traffic happens and FALSE is returned; the caller then drops its reference.
+/**
+ * admit:
+ * @task: (not nullable): the operation's task
+ * @self: (not nullable): the provider
+ * @url: (transfer full) (nullable): the built request URL, NULL if building failed
+ * @url_error: (transfer full) (nullable): the builder's error; non-NULL exactly when @url is NULL
+ *   (the URL builders set it on every failure path)
+ * @requests: number of GETs the operation needs (1 or 2)
+ *
+ * Admission control for an operation of @requests GETs. Returns TRUE if it may start. Otherwise
+ * @task is completed with the error (@url_error, taken, when @url is NULL; STK_ERROR_RATE_LIMITED
+ * when the in-flight cap would be exceeded), @url (taken) is freed, no network traffic happens and
+ * FALSE is returned; the caller then drops its reference.
+ *
+ * Preconditions:
+ *  - @task and @self are valid; @requests is 1 or 2; self->inflight is at most
+ *    STK_NASDAQ_MAX_INFLIGHT (it only grows through op_new() after this check), so the sum cannot
+ *    overflow a guint.
+ * Postconditions:
+ *  - on TRUE nothing is consumed (the caller keeps @url and @url_error is NULL); on FALSE @task has
+ *    been completed with the error and @url / @url_error were consumed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: consumes @url and @url_error on FALSE; @task and @self stay with the caller.
+ *
+ * Returns: TRUE if the operation may start, FALSE if it was rejected.
  */
 static gboolean
 admit(GTask *task, StkNasdaq *self, char *url, GError *url_error, guint requests)
@@ -1301,8 +2306,29 @@ admit(GTask *task, StkNasdaq *self, char *url, GError *url_error, guint requests
   return TRUE;
 }
 
-/* Starts one admitted request as @task. Takes @url and the caller's
- * reference to @task. */
+/**
+ * op_start:
+ * @task: (transfer full): the operation's task
+ * @type: what to parse
+ * @url: (transfer full): the request URL
+ * @symbol: (nullable): requested symbol; copied
+ * @kind: requested kind
+ * @range: requested range
+ *
+ * Starts one admitted request as @task. Takes @url and the caller's reference to @task.
+ *
+ * Preconditions:
+ *  - @task has a StkNasdaq source object and no task data; @url is non-NULL (admit() returned
+ *    TRUE).
+ * Postconditions:
+ *  - the task owns a new Op (freed by op_free()); if the cancellable is already cancelled the task
+ *    is completed with G_IO_ERROR_CANCELLED, otherwise the first attempt has started. The caller's
+ *    task reference is dropped before returning, the task living on through the references of its
+ *    callbacks.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @url and of the caller's reference to @task; @symbol stays with the
+ *   caller.
+ */
 static void
 op_start(GTask *task, OpType type, char *url, const char *symbol, StkKind kind, StkRange range)
 {
@@ -1316,6 +2342,30 @@ op_start(GTask *task, OpType type, char *url, const char *symbol, StkKind kind, 
   g_object_unref(task);
 }
 
+/**
+ * nasdaq_fetch_quote_async:
+ * @provider: (not nullable): the StkNasdaq
+ * @symbol: (not nullable): ticker; copied
+ * @kind: instrument kind
+ * @cancellable: (nullable): cancels the operation
+ * @callback: (scope async): called once with the result
+ * @user_data: passed to @callback
+ *
+ * StkProviderInterface.fetch_quote_async: starts a quote request (see
+ * stk_provider_fetch_quote_async()).
+ *
+ * Preconditions:
+ *  - @provider is a StkNasdaq (it is reached only through that class's StkProvider vtable);
+ *    @symbol is non-NULL (checked by the dispatcher) and NUL-terminated (caller obligation,
+ *    not checked).
+ * Postconditions:
+ *  - @callback is called once. An invalid symbol/kind completes the task with STK_ERROR_INVALID_ARG
+ *    and an over-cap request with STK_ERROR_RATE_LIMITED, with no network traffic; otherwise one
+ *    GET is in flight.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the task takes references on @provider and @cancellable; @symbol is copied; @user_data
+ *   is only passed on.
+ */
 static void
 nasdaq_fetch_quote_async(StkProvider *provider, const char *symbol, StkKind kind,
                          GCancellable *cancellable, GAsyncReadyCallback callback,
@@ -1332,6 +2382,24 @@ nasdaq_fetch_quote_async(StkProvider *provider, const char *symbol, StkKind kind
     g_object_unref(task);
 }
 
+/**
+ * nasdaq_fetch_quote_finish:
+ * @provider: (not nullable): the StkNasdaq the request was started on
+ * @result: (not nullable): the result passed to the callback
+ * @error: (nullable): return location for a #GError
+ *
+ * StkProviderInterface.fetch_quote_finish.
+ *
+ * Preconditions:
+ *  - @result is a GTask created by nasdaq_fetch_quote_async() for @provider and not yet finished
+ *    (checked with g_return_val_if_fail()).
+ * Postconditions:
+ *  - on failure NULL is returned and *@error is set; the task result is consumed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the quote is returned to the caller; @provider and @result stay with the caller.
+ *
+ * Returns: (transfer full) (nullable): the quote, or NULL with @error set.
+ */
 static StkQuote *
 nasdaq_fetch_quote_finish(StkProvider *provider, GAsyncResult *result, GError **error)
 {
@@ -1344,19 +2412,43 @@ nasdaq_fetch_quote_finish(StkProvider *provider, GAsyncResult *result, GError **
 /* 1D series: chart + quote joined                                          */
 /* ------------------------------------------------------------------------ */
 
-/* Task data of the series task of a 1D operation. The chart and the quote
- * run as two inner tasks on @child, a cancellable of their own, so that a
- * failed chart can cancel the quote and a caller's cancellation reaches both. */
+/*
+ * Task data of the series task of a 1D operation. The chart and the quote run as two inner
+ * tasks on @child, a cancellable of their own, so that a failed chart can cancel the quote and
+ * a caller's cancellation reaches both. Created by series_1d_start(), owned by the series task
+ * (freed by join_free()) and used from the main thread only.
+ *
+ * Ownership: child is a strong reference owned by the Join (the inner tasks and the watch
+ * source take their own); user_cancel is a GSource reference owned by the Join whose callback
+ * data is a child reference; chart is owned by the Join until join_try_complete() moves it into
+ * the series task's result. Both inner tasks hold a reference to the series task as callback
+ * data (on_chart_done() / on_prev_close_done() release it), so the series task and this Join
+ * outlive both callbacks; `finished` makes a late callback discard its result.
+ */
 typedef struct {
   GCancellable *child;
   GSource *user_cancel; /* watches the caller's cancellable (nullable) */
-  StkSeries *chart;     /* parsed chart, once chart_done */
+  StkSeries *chart;     /* parsed chart, once chart_done; owned until moved to the result */
   double prev_close;    /* NAN until the quote supplied one */
   gboolean chart_done;
   gboolean quote_done;
   gboolean finished; /* the series task has been given its result */
 } Join;
 
+/**
+ * join_unwatch:
+ * @join: (not nullable): the series task's Join
+ *
+ * Stops watching the caller's cancellable.
+ *
+ * Preconditions:
+ *  - @join is live (owned by its series task); may be called repeatedly.
+ * Postconditions:
+ *  - join->user_cancel is NULL; its source is destroyed, which releases the child reference held by
+ *    its callback data.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the GSource reference owned by @join is released.
+ */
 static void
 join_unwatch(Join *join)
 {
@@ -1366,6 +2458,21 @@ join_unwatch(Join *join)
   }
 }
 
+/**
+ * join_free:
+ * @data: (not nullable): the Join created in series_1d_start()
+ *
+ * GDestroyNotify of the series task data: releases the Join.
+ *
+ * Preconditions:
+ *  - @data is the Join installed with g_task_set_task_data(); called once, when the series task is
+ *    finalised.
+ * Postconditions:
+ *  - the watch is removed, the child cancellable and an unclaimed chart are released and @data is
+ *    freed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @data and of its child, user_cancel and chart members.
+ */
 static void
 join_free(gpointer data)
 {
@@ -1376,7 +2483,22 @@ join_free(gpointer data)
   g_free(join);
 }
 
-/* Fails the series with @error (taken) and cancels whatever is still running. */
+/**
+ * join_fail:
+ * @series_task: (not nullable): the series task
+ * @error: (transfer full): the error to report
+ *
+ * Fails the series with @error (taken) and cancels whatever is still running.
+ *
+ * Preconditions:
+ *  - @series_task has a Join as task data, is not yet returned (join->finished is FALSE) and the
+ *    caller holds a reference to it.
+ * Postconditions:
+ *  - join->finished is TRUE (later completions of the chart/quote tasks are discarded), the watch
+ *    is removed, the child cancellable is cancelled and @series_task is completed with @error.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @error; @series_task stays with the caller.
+ */
 static void
 join_fail(GTask *series_task, GError *error)
 {
@@ -1387,6 +2509,24 @@ join_fail(GTask *series_task, GError *error)
   g_task_return_error(series_task, error);
 }
 
+/**
+ * join_try_complete:
+ * @series_task: (not nullable): the series task
+ *
+ * Completes the series once both the chart and the quote have ended: attaches the previous close to
+ * the chart series and returns it.
+ *
+ * Preconditions:
+ *  - @series_task has a Join as task data and is not yet returned. join->chart is non-NULL whenever
+ *    join->chart_done is TRUE (on_chart_done() sets both together), and that series is solely owned
+ *    by the Join (freshly parsed, never shared), so writing series->prev_close directly is allowed.
+ * Postconditions:
+ *  - if either part is still pending nothing happens; otherwise join->finished is TRUE, the watch
+ *    is removed, the chart series (prev_close set to join->prev_close, NAN when the quote gave
+ *    none) is moved out of the Join and @series_task is completed with it.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: ownership of the chart series moves from the Join to the task result.
+ */
 static void
 join_try_complete(GTask *series_task)
 {
@@ -1400,6 +2540,26 @@ join_try_complete(GTask *series_task)
   g_task_return_pointer(series_task, series, series_destroy);
 }
 
+/**
+ * on_chart_done:
+ * @source: (unused): the StkNasdaq
+ * @result: (not nullable): the chart task's result
+ * @user_data: (transfer full): the series task reference taken in series_1d_start(), released here
+ *
+ * GAsyncReadyCallback of the chart sub-task of a 1D series: a chart failure fails the series;
+ * success is stored in the Join.
+ *
+ * Preconditions:
+ *  - @user_data is a series task with a Join; @result is a task created in series_1d_start().
+ * Postconditions:
+ *  - the chart result is always consumed. If the series has already finished (failure or
+ *    cancellation) the result is discarded; on failure join_fail() completes the series with the
+ *    chart's error; on success the series is stored in join->chart, chart_done is set and
+ *    join_try_complete() runs.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the chart series moves into the Join (or is freed); @user_data is released through the
+ *   g_autoptr on every path.
+ */
 static void
 on_chart_done(GObject *source, GAsyncResult *result, gpointer user_data)
 {
@@ -1422,6 +2582,25 @@ on_chart_done(GObject *source, GAsyncResult *result, gpointer user_data)
   join_try_complete(series_task);
 }
 
+/**
+ * on_prev_close_done:
+ * @source: (unused): the StkNasdaq
+ * @result: (not nullable): the quote task's result (a heap double or an error)
+ * @user_data: (transfer full): the series task reference taken in series_1d_start(), released here
+ *
+ * GAsyncReadyCallback of the quote sub-task of a 1D series: stores the previous close, if any. Any
+ * quote failure, a cancellation included, only leaves prev_close NAN: a caller's cancellation is
+ * reported by the series task itself (GTask checks its cancellable when the result is collected).
+ *
+ * Preconditions:
+ *  - @user_data is a series task with a Join; @result is a task created in series_1d_start().
+ * Postconditions:
+ *  - the result is consumed and freed; unless the series has already finished, join->prev_close is
+ *    the value (when one was returned), quote_done is TRUE and join_try_complete() runs.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the heap double is freed here; @user_data is released through the g_autoptr on every
+ *   path.
+ */
 static void
 on_prev_close_done(GObject *source, GAsyncResult *result, gpointer user_data)
 {
@@ -1446,6 +2625,25 @@ on_prev_close_done(GObject *source, GAsyncResult *result, gpointer user_data)
   join_try_complete(series_task);
 }
 
+/**
+ * on_join_user_cancelled:
+ * @user: (unused): the caller's cancellable
+ * @child: (not nullable): the Join's child GCancellable (passed as gpointer)
+ *
+ * GCancellableSource callback: the caller cancelled a 1D series, so both sub-requests are cancelled
+ * through the child cancellable (from the main loop, never inside the caller's
+ * g_cancellable_cancel()).
+ *
+ * Preconditions:
+ *  - @child is the reference taken in series_1d_start() and owned by the source's callback data
+ *    (released when the source is destroyed by join_unwatch()).
+ * Postconditions:
+ *  - the child cancellable is cancelled; the source is removed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: @child stays owned by the source.
+ *
+ * Returns: G_SOURCE_REMOVE.
+ */
 static gboolean
 on_join_user_cancelled(GCancellable *user, gpointer child)
 {
@@ -1454,17 +2652,45 @@ on_join_user_cancelled(GCancellable *user, gpointer child)
   return G_SOURCE_REMOVE;
 }
 
-/*
- * Starts the two requests of a 1D series for @series_task, whose chart URL is
- * @chart_url (taken). Takes the caller's reference to @series_task.
+/**
+ * series_1d_start:
+ * @series_task: (transfer full): the series task
+ * @self: (not nullable): the provider
+ * @symbol: the requested symbol; copied
+ * @kind: requested kind
+ * @chart_url: (transfer full): the chart URL
+ *
+ * Starts the two requests of a 1D series for @series_task, whose chart URL is @chart_url (taken).
+ * Takes the caller's reference to @series_task.
+ *
+ * Preconditions:
+ *  - admit() succeeded for two requests; @chart_url is non-NULL; @symbol and @kind already passed
+ *    stk_nasdaq_series_url(), so the quote URL can be built. The caller has checked that the task
+ *    is not cancelled.
+ * Postconditions:
+ *  - normally the series task owns a Join, a chart task (OP_SERIES) and a quote task
+ *    (OP_PREV_CLOSE) are running on the Join's child cancellable and each holds a reference to the
+ *    series task. If the quote URL could not be built (cannot happen after the chart URL succeeded)
+ *    the series task is completed with that builder's error, @chart_url is freed and no request
+ *    starts; this replaces the former g_assert().
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: takes ownership of @chart_url and of the caller's reference to @series_task; @symbol
+ *   stays with the caller.
  */
 static void
 series_1d_start(GTask *series_task, StkNasdaq *self, const char *symbol, StkKind kind,
                 char *chart_url)
 {
-  /* The chart URL was built, so symbol and kind are valid. */
-  char *quote_url = stk_nasdaq_quote_url(self->base_url, symbol, kind, NULL);
-  g_assert(quote_url != NULL);
+  /* The chart URL was built, so symbol and kind are valid and this cannot fail;
+   * a failure would still be reported as the series' error. */
+  GError *quote_error = NULL;
+  char *quote_url = stk_nasdaq_quote_url(self->base_url, symbol, kind, &quote_error);
+  if (quote_url == NULL) {
+    g_free(chart_url);
+    g_task_return_error(series_task, quote_error);
+    g_object_unref(series_task);
+    return;
+  }
 
   Join *join = g_new0(Join, 1);
   join->child = g_cancellable_new();
@@ -1488,6 +2714,31 @@ series_1d_start(GTask *series_task, StkNasdaq *self, const char *symbol, StkKind
   op_start(quote, OP_PREV_CLOSE, quote_url, symbol, kind, STK_RANGE_1D);
 }
 
+/**
+ * nasdaq_fetch_series_async:
+ * @provider: (not nullable): the StkNasdaq
+ * @symbol: (not nullable): ticker; copied
+ * @kind: instrument kind
+ * @range: chart range
+ * @cancellable: (nullable): cancels the operation
+ * @callback: (scope async): called once with the result
+ * @user_data: passed to @callback
+ *
+ * StkProviderInterface.fetch_series_async: starts a series request (see
+ * stk_provider_fetch_series_async()). A 1D series runs a chart and a quote request joined; other
+ * ranges one request.
+ *
+ * Preconditions:
+ *  - @provider is a StkNasdaq and @symbol is non-NULL (checked by the dispatcher) and
+ *    NUL-terminated (caller obligation, not checked).
+ * Postconditions:
+ *  - @callback is called once: an invalid argument completes the task with STK_ERROR_INVALID_ARG,
+ *    an over-cap request with STK_ERROR_RATE_LIMITED (a 1D series needs two slots), an already
+ *    cancelled caller with G_IO_ERROR_CANCELLED, all without network traffic.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the task takes references on @provider and @cancellable; @symbol is copied; @user_data
+ *   is only passed on.
+ */
 static void
 nasdaq_fetch_series_async(StkProvider *provider, const char *symbol, StkKind kind, StkRange range,
                           GCancellable *cancellable, GAsyncReadyCallback callback,
@@ -1520,6 +2771,24 @@ nasdaq_fetch_series_async(StkProvider *provider, const char *symbol, StkKind kin
   }
 }
 
+/**
+ * nasdaq_fetch_series_finish:
+ * @provider: (not nullable): the StkNasdaq the request was started on
+ * @result: (not nullable): the result passed to the callback
+ * @error: (nullable): return location for a #GError
+ *
+ * StkProviderInterface.fetch_series_finish.
+ *
+ * Preconditions:
+ *  - @result is a GTask created by nasdaq_fetch_series_async() for @provider and not yet finished
+ *    (checked with g_return_val_if_fail()).
+ * Postconditions:
+ *  - on failure NULL is returned and *@error is set; the task result is consumed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the series is returned to the caller; @provider and @result stay with the caller.
+ *
+ * Returns: (transfer full) (nullable): the series, or NULL with @error set.
+ */
 static StkSeries *
 nasdaq_fetch_series_finish(StkProvider *provider, GAsyncResult *result, GError **error)
 {
@@ -1528,6 +2797,27 @@ nasdaq_fetch_series_finish(StkProvider *provider, GAsyncResult *result, GError *
   return g_task_propagate_pointer(G_TASK(result), error);
 }
 
+/**
+ * nasdaq_search_async:
+ * @provider: (not nullable): the StkNasdaq
+ * @text: (not nullable): user text; copied into the URL
+ * @cancellable: (nullable): cancels the operation
+ * @callback: (scope async): called once with the result
+ * @user_data: passed to @callback
+ *
+ * StkProviderInterface.search_async: starts a search request (see stk_provider_search_async()).
+ *
+ * Preconditions:
+ *  - @provider is a StkNasdaq and @text is non-NULL (checked by the dispatcher) and
+ *    NUL-terminated (caller obligation, not checked).
+ * Postconditions:
+ *  - @callback is called once. Unacceptable text completes the task with STK_ERROR_INVALID_ARG and
+ *    an over-cap request with STK_ERROR_RATE_LIMITED, with no network traffic; otherwise one GET is
+ *    in flight.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the task takes references on @provider and @cancellable; @text is not retained;
+ *   @user_data is only passed on.
+ */
 static void
 nasdaq_search_async(StkProvider *provider, const char *text, GCancellable *cancellable,
                     GAsyncReadyCallback callback, gpointer user_data)
@@ -1543,6 +2833,25 @@ nasdaq_search_async(StkProvider *provider, const char *text, GCancellable *cance
     g_object_unref(task);
 }
 
+/**
+ * nasdaq_search_finish:
+ * @provider: (not nullable): the StkNasdaq the request was started on
+ * @result: (not nullable): the result passed to the callback
+ * @error: (nullable): return location for a #GError
+ *
+ * StkProviderInterface.search_finish.
+ *
+ * Preconditions:
+ *  - @result is a GTask created by nasdaq_search_async() for @provider and not yet finished
+ *    (checked with g_return_val_if_fail()).
+ * Postconditions:
+ *  - on failure NULL is returned and *@error is set; the task result is consumed.
+ * Thread affinity: main thread only (the thread running the GLib main context)
+ * Ownership: the array is returned to the caller; @provider and @result stay with the caller.
+ *
+ * Returns: (transfer full) (nullable) (element-type StkSearchHit): the hits, or NULL with @error
+ *   set.
+ */
 static GPtrArray *
 nasdaq_search_finish(StkProvider *provider, GAsyncResult *result, GError **error)
 {
@@ -1551,6 +2860,19 @@ nasdaq_search_finish(StkProvider *provider, GAsyncResult *result, GError **error
   return g_task_propagate_pointer(G_TASK(result), error);
 }
 
+/**
+ * stk_nasdaq_provider_init:
+ * @iface: (not nullable): the interface vtable of StkNasdaq
+ *
+ * GObject interface initialiser: wires the six StkProviderInterface virtual functions.
+ *
+ * Preconditions:
+ *  - called once by the GType system; @iface is writable.
+ * Postconditions:
+ *  - all six virtual functions are set.
+ * Thread affinity: any thread (called by GObject under its type lock).
+ * Ownership: @iface is owned by the type system and not retained.
+ */
 static void
 stk_nasdaq_provider_init(StkProviderInterface *iface)
 {

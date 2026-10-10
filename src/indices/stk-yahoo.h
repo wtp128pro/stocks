@@ -6,7 +6,8 @@
  * Read-only GETs over HTTPS (plain HTTP is accepted only towards loopback
  * hosts, for tests). No API key, cookie, crumb, consent handling, credential
  * or referer is ever sent, and the app's identifying User-Agent is not
- * disguised (libsoup adds Host and Accept-Encoding); nothing is stored. If
+ * disguised (the app adds Accept: application/json; libsoup adds Host and Accept-Encoding);
+ * nothing is stored. If
  * Yahoo refuses the requests (HTTP 4xx, throttling) the operations fail;
  * they are never retried differently or worked around.
  *
@@ -62,7 +63,9 @@
  * other 4xx, 5xx) -> STK_ERROR_HTTP. A JSON body whose chart.error is set
  * (Yahoo's way to say "unknown symbol", usually with HTTP 404) ->
  * STK_ERROR_NOT_FOUND; malformed JSON or a body of the wrong shape ->
- * STK_ERROR_PARSE; a body that ends before its declared Content-Length or a
+ * STK_ERROR_PARSE; a URL libsoup refuses (an origin accepted by stk_yahoo_new_custom()
+ * whose host libsoup rejects) -> STK_ERROR_INVALID_ARG
+ * "malformed request URL", without network traffic; a body that ends before its declared Content-Length or a
  * transport failure -> STK_ERROR_NETWORK. The body is limited to
  * STK_YAHOO_MAX_BODY_BYTES after content decoding (larger -> STK_ERROR_PARSE).
  * TLS certificates are always verified.
@@ -71,9 +74,10 @@
  * an EMPTY array for every text (the text is not inspected) and never
  * touches the network; the indices are found through the catalog.
  *
- * All functions must be used from the thread that runs the GLib main context
- * (normally the main thread); StkYahoo is not thread-safe. Operations keep
- * the provider alive until they complete.
+ * All functions except the pure request builder and response parsers (stk_yahoo_chart_url(),
+ * stk_yahoo_parse_quote(), stk_yahoo_parse_series()), which may be called from any thread, must be
+ * used from the thread that runs the GLib main context (normally the main thread); StkYahoo is
+ * not thread-safe. Operations keep the provider alive until they complete.
  */
 #ifndef STK_YAHOO_H
 #define STK_YAHOO_H
@@ -103,6 +107,16 @@ G_DECLARE_FINAL_TYPE(StkYahoo, stk_yahoo, STK, YAHOO, GObject)
 /**
  * stk_yahoo_new:
  *
+ * Creates the production provider.
+ *
+ * Preconditions:
+ *  - Called from the thread that will run the GLib main context.
+ * Postconditions:
+ *  - The instance uses STK_YAHOO_BASE_URL, STK_YAHOO_TIMEOUT_MS and STK_YAHOO_MIN_GAP_MS and has
+ *    no outstanding operation.
+ * Thread affinity: main thread only.
+ * Ownership: the caller owns the returned reference.
+ *
  * Returns: (transfer full): a StkProvider talking to STK_YAHOO_BASE_URL with
  *   STK_YAHOO_TIMEOUT_MS and STK_YAHOO_MIN_GAP_MS. It owns one HTTP session
  *   and the request queue, so create ONE instance and share it: the spacing
@@ -123,8 +137,28 @@ StkYahoo *stk_yahoo_new(void);
  * @error: (nullable): receives STK_ERROR_INVALID_ARG if @base_url is not
  *   acceptable.
  *
+ * Creates a provider with a custom origin and timing.
+ *
+ * Preconditions:
+ *  - @base_url is non-NULL and NUL-terminated; @timeout_ms and @min_gap_ms
+ *    are in the ranges above (violations are a g_return_val_if_fail()
+ *    critical returning NULL, with @error untouched).
+ *  - @error is NULL or points to a NULL GError* (not checked: if it points to
+ *    a set error, g_set_error() warns and keeps the old error).
+ *  - Called from the thread that will run the GLib main context.
+ * Postconditions:
+ *  - On success the provider holds a normalised copy of @base_url (a single
+ *    trailing "/" removed) and the two timings, and @error is untouched. If
+ *    @base_url is not acceptable NULL is returned, *@error (when @error is
+ *    non-NULL) is set to STK_ERROR / STK_ERROR_INVALID_ARG and nothing is
+ *    allocated that outlives the call.
+ * Thread affinity: main thread only.
+ * Ownership: @base_url stays with the caller (copied); the caller owns the
+ *   returned reference.
+ *
  * Returns: (transfer full) (nullable): the provider, or NULL with @error set.
- *   Out-of-range numbers are a programming error (critical, NULL).
+ *   Out-of-range numbers are a programming error (critical, NULL, @error not
+ *   set).
  */
 StkYahoo *stk_yahoo_new_custom(const char *base_url, guint timeout_ms, guint min_gap_ms,
                                GError **error);
@@ -136,11 +170,29 @@ StkYahoo *stk_yahoo_new_custom(const char *base_url, guint timeout_ms, guint min
 /**
  * stk_yahoo_chart_url:
  * @base_url: origin as accepted by stk_yahoo_new_custom(), no trailing "/".
- * @symbol: must satisfy stk_symbol_is_valid(); upper-cased and
+ * @symbol: (nullable): must satisfy stk_symbol_is_valid(); upper-cased and
  *   percent-encoded into the URL path.
  * @kind: must be STK_KIND_INDEX.
  * @range: selects range and interval (table in the file comment).
  * @error: (nullable): receives STK_ERROR_INVALID_ARG.
+ *
+ * Builds the chart URL of a request.
+ *
+ * Preconditions:
+ *  - @base_url is non-NULL and NUL-terminated (it is inserted verbatim; it is
+ *    not validated here).
+ *  - @symbol is NULL (rejected) or NUL-terminated.
+ *  - @error is NULL or points to a NULL GError* (caller obligation, not checked: if
+ *    it points to a non-NULL GError, a failure leaves that error in place and GLib logs
+ *    a warning).
+ * Postconditions:
+ *  - On success *@error is untouched. On failure NULL is returned, *@error
+ *    (when @error is non-NULL and pointed to NULL) is set to STK_ERROR_INVALID_ARG and
+ *    nothing is allocated that outlives the call. The symbol is checked first, then the
+ *    kind, then the range.
+ * Thread affinity: any thread (pure).
+ * Ownership: @base_url and @symbol stay with the caller; the caller owns the
+ *   returned string.
  *
  * Returns: (transfer full): the chart URL (also the quote URL when @range is
  *   STK_RANGE_1D); NULL with STK_ERROR_INVALID_ARG if @symbol, @kind or
@@ -151,7 +203,7 @@ char *stk_yahoo_chart_url(const char *base_url, const char *symbol, StkKind kind
 
 /**
  * stk_yahoo_parse_quote:
- * @data: body of a range=1d chart response (@len bytes, need not be
+ * @data: (nullable): body of a range=1d chart response (@len bytes, need not be
  *   NUL-terminated). The caller MUST pass a range=1d response: the previous
  *   close of other ranges is the close before the range start and would give
  *   a wrong change.
@@ -170,8 +222,25 @@ char *stk_yahoo_chart_url(const char *base_url, const char *symbol, StkKind kind
  * 2022-01-01..2100-12-31). is_realtime is FALSE (delayed data) and
  * market_open is FALSE (the chart endpoint does not report the market
  * state). currency = meta.currency if it is three upper-case ASCII letters,
- * else "USD". name = meta.longName, else meta.shortName, when that is at most
- * 256 bytes without control characters; else "".
+ * else "USD". name = meta.longName if usable (non-empty, at most 256 bytes, valid UTF-8, no
+ * control characters), else meta.shortName if usable, else "".
+ *
+ * Preconditions:
+ *  - @data is NULL (reported as STK_ERROR_PARSE) or points to @len readable
+ *    bytes; a @len above STK_YAHOO_MAX_BODY_BYTES is rejected with
+ *    STK_ERROR_PARSE before any byte is read.
+ *  - @symbol is NULL or NUL-terminated (it must satisfy stk_symbol_is_valid()
+ *    and @kind must be STK_KIND_INDEX, else STK_ERROR_INVALID_ARG, checked
+ *    before the body).
+ *  - @error is NULL or points to a NULL GError* (else critical, NULL).
+ * Postconditions:
+ *  - On success *@error is untouched. On failure NULL is returned and *@error
+ *    (when non-NULL) is set: STK_ERROR_INVALID_ARG (symbol, kind),
+ *    STK_ERROR_PARSE (empty, too large, not UTF-8, malformed or misshapen
+ *    body, no usable price) or STK_ERROR_NOT_FOUND (chart.error set).
+ * Thread affinity: any thread (pure).
+ * Ownership: @data and @symbol stay with the caller and are not retained; the
+ *   caller owns the returned quote.
  *
  * Returns: (transfer full): the quote, or NULL with @error set.
  */
@@ -180,7 +249,7 @@ StkQuote *stk_yahoo_parse_quote(const guint8 *data, gsize len, const char *symbo
 
 /**
  * stk_yahoo_parse_series:
- * @data: chart response body fetched for @range.
+ * @data: (nullable): chart response body fetched for @range.
  * @len: body length; at most STK_YAHOO_MAX_BODY_BYTES.
  * @range: the requested range; the series' range.
  * @error: (nullable): see the error mapping in the file comment.
@@ -203,6 +272,23 @@ StkQuote *stk_yahoo_parse_quote(const guint8 *data, gsize len, const char *symbo
  * the sample's timestamp; there is at most one point per date (the latest
  * sample with a close wins); prev_close is NAN (chartPreviousClose of these
  * responses is the close before the range start and is never used).
+ *
+ * Preconditions:
+ *  - @data is NULL (reported as STK_ERROR_PARSE) or points to @len readable
+ *    bytes; a @len above STK_YAHOO_MAX_BODY_BYTES is rejected with
+ *    STK_ERROR_PARSE before any byte is read.
+ *  - @range must be a StkRange enumerator (else STK_ERROR_INVALID_ARG).
+ *  - @error is NULL or points to a NULL GError* (else critical, NULL).
+ * Postconditions:
+ *  - On success *@error is untouched. On failure NULL is returned and *@error
+ *    (when non-NULL) is set: STK_ERROR_INVALID_ARG (range), STK_ERROR_PARSE
+ *    (empty, too large, not UTF-8, malformed or misshapen body, no regular
+ *    trading period for STK_RANGE_1D, timestamp not an array, timestamps
+ *    without close prices) or STK_ERROR_NOT_FOUND (chart.error set).
+ * Thread affinity: any thread (pure; the only shared state is a read-only,
+ *   once-initialised time zone).
+ * Ownership: @data stays with the caller and is not retained; the caller owns
+ *   the returned series.
  *
  * Returns: (transfer full): series with range == @range (possibly empty), or
  *   NULL with @error set.
