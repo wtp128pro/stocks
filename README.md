@@ -74,14 +74,49 @@ talks to the network.
 
 ## Install
 
-### From the RPM (Fedora)
+### From the signed RPM repository (Fedora, recommended)
 
-Download `stocks-0.1.0-1.<dist>.<arch>.rpm` from the
-[GitHub releases](https://github.com/wtp128pro/stocks/releases) page and
-install it with
+The RPMs and the repository metadata are signed. Add the repository and
+install; `dnf` shows the key fingerprint and asks you to confirm it:
 
 ```sh
+sudo curl -fsSLo /etc/yum.repos.d/stocks.repo https://wtp128pro.github.io/stocks/stocks.repo
+sudo dnf install stocks
+```
+
+The signing key is
+
+```
+Stocks Release Signing Key <wtp128pro@users.noreply.github.com>
+RSA 4096, created 2026-10-10, expires 2029-10-09
+Fingerprint: 1910 F9DB 58D0 7BF5 83CC  BB6F 9226 BBD4 F352 B9A6
+```
+
+Compare the fingerprint with the one `dnf` prints, with the key file
+`packaging/rpm/RPM-GPG-KEY-stocks` in this repository, with the GitHub release
+notes and with https://wtp128pro.github.io/stocks/. The repository serves
+Fedora 44 (`x86_64` and source) only, because the packages are built there.
+
+### From a downloaded RPM (Fedora)
+
+Download `stocks-0.1.0-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
+[GitHub releases](https://github.com/wtp128pro/stocks/releases) page, check the
+signature and install:
+
+```sh
+gpg --show-keys RPM-GPG-KEY-stocks            # compare the fingerprint above
+sudo rpm --import RPM-GPG-KEY-stocks
+rpm -K stocks-0.1.0-1.*.rpm                   # must say "digests signatures OK"
 sudo dnf install ./stocks-0.1.0-1.*.rpm
+```
+
+`rpm -K` also exits 0 for an unsigned package, which it reports as just
+`digests OK`; look for `signatures OK`. The release also has `SHA256SUMS` and
+detached signatures (`SHA256SUMS.asc`, `stocks-0.1.0.tar.gz.asc`):
+
+```sh
+gpg --import RPM-GPG-KEY-stocks
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
 ```
 
 It installs the `stocks` command, a desktop entry (Office / Finance), an
@@ -777,3 +812,30 @@ standard `.gnu_debugdata` mini-symbol table. `rpmbuild` also produces
 they are **not** among the published v0.1.0 release assets. The binary of
 `make install` is a different build, a plain `--buildtype=release` one
 stripped completely (see "Makefile").
+
+### Signing and publishing (maintainer)
+
+Releases are signed by `tools/sign-release.sh IN_DIR OUT_DIR` with a dedicated
+RSA 4096 key (not the maintainer's personal key), kept in its own `GNUPGHOME`
+and protected by a passphrase. The script, given the unsigned `*.rpm` and
+`*.tar.gz` files:
+
+1. signs every RPM with `rpmsign --addsign` (the payload is untouched; only the
+   header signature is added) and checks each one with `rpm -K` against a
+   scratch rpmdb that trusts only that key, since a bare `rpm -K` passes an
+   unsigned package;
+2. writes `SHA256SUMS` and detached ASCII-armored signatures for it and for the
+   tarball, and verifies them with `gpg --verify`;
+3. builds the dnf repository tree (`fedora/<N>/<arch>/`, `fedora/<N>/SRPMS/`)
+   with `createrepo_c` and signs each `repodata/repomd.xml`
+   (`repo_gpgcheck=1` in `stocks.repo`);
+4. refuses to run if `packaging/rpm/RPM-GPG-KEY-stocks` is not the exported
+   public key of `SIGN_KEY`.
+
+`OUT_DIR/release/` holds the GitHub release assets and `OUT_DIR/site/` is the
+content of the `gh-pages` branch (GitHub Pages, https://wtp128pro.github.io/stocks/).
+Only the public key is ever published. Replacing or rotating the key means a
+new key, a new `packaging/rpm/RPM-GPG-KEY-stocks`, a re-signed repository and a
+release note; the revocation certificate generated with the key must be kept
+offline. The key expires on 2029-10-09 and must be extended or replaced
+before then.

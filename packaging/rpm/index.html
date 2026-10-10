@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stocks: signed RPM repository</title>
+</head>
+<body>
+<h1>Stocks: signed RPM repository</h1>
+<p>Packages and repository metadata are signed with the key below. Source and
+documentation: <a href="https://github.com/wtp128pro/stocks">github.com/wtp128pro/stocks</a>.</p>
+
+<h2>Install (Fedora, dnf5)</h2>
+<pre>sudo curl -fsSLo /etc/yum.repos.d/stocks.repo https://wtp128pro.github.io/stocks/stocks.repo
+sudo dnf install stocks</pre>
+<p>dnf asks you to confirm the key fingerprint on first use. Compare it with the
+one below.</p>
+
+<h2>Signing key</h2>
+<pre>Stocks Release Signing Key &lt;wtp128pro@users.noreply.github.com&gt;
+RSA 4096, created 2026-10-10, expires 2029-10-09
+Fingerprint: 1910 F9DB 58D0 7BF5 83CC  BB6F 9226 BBD4 F352 B9A6</pre>
+<p><a href="RPM-GPG-KEY-stocks">RPM-GPG-KEY-stocks</a> (ASCII-armored public key).
+The fingerprint is also in the README and on each GitHub release.</p>
+
+<h2>Verify a downloaded RPM by hand</h2>
+<pre>sudo rpm --import https://wtp128pro.github.io/stocks/RPM-GPG-KEY-stocks
+rpm -K stocks-*.rpm        # must print: digests signatures OK</pre>
+<p>A package without a signature also exits 0 and prints only
+<code>digests OK</code>; look for <code>signatures OK</code>.</p>
+
+<h2>Files</h2>
+<ul>
+<li><a href="stocks.repo">stocks.repo</a> (dnf repository definition)</li>
+<li><a href="fedora/44/x86_64/repodata/repomd.xml">fedora/44/x86_64/repodata/repomd.xml</a>
+(<a href="fedora/44/x86_64/repodata/repomd.xml.asc">.asc</a>), binary RPMs</li>
+<li><a href="fedora/44/SRPMS/repodata/repomd.xml">fedora/44/SRPMS/repodata/repomd.xml</a>
+(<a href="fedora/44/SRPMS/repodata/repomd.xml.asc">.asc</a>), source RPMs</li>
+</ul>
+</body>
+</html>
