@@ -1,0 +1,15 @@
+[stocks]
+name=Stocks for Fedora $releasever - $basearch
+baseurl=https://wtp128pro.github.io/stocks/fedora/$releasever/$basearch/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://wtp128pro.github.io/stocks/RPM-GPG-KEY-stocks
+
+[stocks-source]
+name=Stocks for Fedora $releasever - Source
+baseurl=https://wtp128pro.github.io/stocks/fedora/$releasever/SRPMS/
+enabled=0
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://wtp128pro.github.io/stocks/RPM-GPG-KEY-stocks
