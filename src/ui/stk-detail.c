@@ -331,8 +331,13 @@ stk_detail_set_item(StkDetail *self, StkRowItem *item)
 
   gboolean fund = stk_row_item_get_kind(item) == STK_KIND_FUND;
   gtk_widget_set_visible(self->range_buttons[STK_RANGE_1D], !fund);
-  if (fund && self->range == STK_RANGE_1D)
-    set_range_buttons(self, STK_RANGE_1M);
+
+  /* The range is a preference of the item (restored from disk by StkApp); a fund has no 1D. */
+  StkRange range = stk_row_item_get_view_range(item);
+  if (fund && range == STK_RANGE_1D)
+    range = STK_RANGE_1M;
+  if (range != self->range)
+    set_range_buttons(self, range);
 
   gtk_label_set_text(GTK_LABEL(self->symbol_label), stk_row_item_get_symbol(item));
   gtk_label_set_text(GTK_LABEL(self->name_label), stk_row_item_get_name(item));
@@ -397,6 +402,8 @@ on_range_toggled(GtkToggleButton *button, gpointer user_data)
     if ((StkRange)i == self->range)
       return;
     self->range = (StkRange)i;
+    if (self->item != NULL)
+      stk_row_item_set_view_range(self->item, (StkRange)i);
     refresh_chart(self);
     g_signal_emit(self, signals[SIGNAL_RANGE_CHANGED], 0, (guint)i);
     return;

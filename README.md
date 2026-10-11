@@ -99,20 +99,20 @@ Fedora 44 (`x86_64` and source) only, because the packages are built there.
 
 ### From a downloaded RPM (Fedora)
 
-Download `stocks-0.1.0-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
+Download `stocks-0.2.0-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
 [GitHub releases](https://github.com/wtp128pro/stocks/releases) page, check the
 signature and install:
 
 ```sh
 gpg --show-keys RPM-GPG-KEY-stocks            # compare the fingerprint above
 sudo rpm --import RPM-GPG-KEY-stocks
-rpm -K stocks-0.1.0-1.*.rpm                   # must say "digests signatures OK"
-sudo dnf install ./stocks-0.1.0-1.*.rpm
+rpm -K stocks-0.2.0-1.*.rpm                   # must say "digests signatures OK"
+sudo dnf install ./stocks-0.2.0-1.*.rpm
 ```
 
 `rpm -K` also exits 0 for an unsigned package, which it reports as just
 `digests OK`; look for `signatures OK`. The release also has `SHA256SUMS` and
-detached signatures (`SHA256SUMS.asc`, `stocks-0.1.0.tar.gz.asc`):
+detached signatures (`SHA256SUMS.asc`, `stocks-0.2.0.tar.gz.asc`):
 
 ```sh
 gpg --import RPM-GPG-KEY-stocks
@@ -122,7 +122,7 @@ gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
 It installs the `stocks` command, a desktop entry (Office / Finance), an
 AppStream metainfo file and a full-colour and a symbolic icon, and needs no
 runtime dependency beyond the libraries `dnf` resolves from the binary and
-`hicolor-icon-theme`. The source RPM (`stocks-0.1.0-1.*.src.rpm`) is on the
+`hicolor-icon-theme`. The source RPM (`stocks-0.2.0-1.*.src.rpm`) is on the
 same page; see "Packaging notes" below to build it yourself.
 
 ### Build from source
@@ -163,8 +163,8 @@ does not refresh icon or desktop-entry caches.
 The `Makefile` at the repository root is a thin wrapper over Meson and Ninja,
 for convenience; Meson remains the build system. It needs **GNU make** (3.82
 or newer, not BSD make) and no other dependency. `make` alone prints the help.
-The `Makefile` exists on `main` only: it is not in the v0.1.0 tarball and not
-part of the published RPMs.
+The `Makefile` is not in the v0.1.0 tarball (it was added afterwards) and is
+not part of the published RPMs.
 
 | Target | What it does |
 | --- | --- |
@@ -300,9 +300,9 @@ Variables, all overridable on the command line (`make install PREFIX=$HOME/stock
   be empty or made by an earlier `make rpm` (it holds a
   `.stocks-rpmbuild-topdir` marker file). It builds `HEAD`, not the working
   tree: uncommitted changes, including edits of the spec or `meson.build`, are
-  not packaged (the target says so), and commits made after the v0.1.0 tag are
-  built under the spec's version (0.1.0-1), so the result is not the published
-  v0.1.0 release.
+  not packaged (the target says so), and commits made after a release tag are
+  built under the spec's version, so the result is not that published release
+  until the tag points at the commit.
 - **`clean` and `distclean`** refuse an empty value, `/`, `.`, the checkout
   and `$HOME`, a build directory that has no `meson-private/coredata.dat` and
   an `RPMTOP` without the marker file; a directory that does not exist is
@@ -473,6 +473,12 @@ drops the `index` entries when it loads `watchlist.json` and writes the file
 back without them on the next edit of the watchlist, so downgrading removes
 the indices from your list. From `cache.json` it drops only the index quotes;
 the chart series of the indices stay in the file.
+
+Each watchlist entry also stores the view you chose for it: the chart range
+(`"range"`) and whether the list row shows points instead of percent
+(`"points"`). Both keys are optional and the file version stays 1, so older
+files load with 1D/percent and an older build ignores the two keys (and
+drops them when it next saves the watchlist).
 
 ## Performance
 
@@ -740,11 +746,11 @@ project and are covered by the same licence as the program.
 The package is meant to be picked up by Fedora, and the repository carries
 what a reviewer needs:
 
-- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.1.0,
+- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.0,
   `License: GPL-3.0-or-later AND CC0-1.0`, `URL` https://github.com/wtp128pro/stocks).
 - Source: `Source0` is `%{url}/archive/v%{version}/%{name}-%{version}.tar.gz`,
-  i.e. GitHub's archive of the tag `v0.1.0`, named `stocks-0.1.0.tar.gz`, whose
-  top-level directory is `stocks-0.1.0/` (the spec uses `%autosetup`).
+  i.e. GitHub's archive of the tag `v0.2.0`, named `stocks-0.2.0.tar.gz`, whose
+  top-level directory is `stocks-0.2.0/` (the spec uses `%autosetup`).
 - Build with Meson (`%meson`, `%meson_build`, `%meson_install`); no
   patches, no bundled libraries, no Internet access at build or test time.
   `BuildRequires` (all resolve with `rpm -q --whatprovides`): `gcc`, `meson`,
@@ -765,7 +771,7 @@ user, mount and network namespace (explained below):
 ```sh
 top=/var/tmp/stocks-rpmbuild
 mkdir -p "$top/SOURCES"
-git archive --prefix=stocks-0.1.0/ -o "$top/SOURCES/stocks-0.1.0.tar.gz" HEAD
+git archive --prefix=stocks-0.2.0/ -o "$top/SOURCES/stocks-0.2.0.tar.gz" HEAD
 unshare -rmn sh -c 'ip link set lo up && mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $1" packaging/rpm/stocks.spec' sh "$top"
 rpmlint packaging/rpm/stocks.spec "$top"/RPMS/*/stocks-*.rpm "$top"/SRPMS/stocks-*.src.rpm
 ```

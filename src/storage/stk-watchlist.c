@@ -347,6 +347,8 @@ append_entry(StkWatchlist *self, const char *symbol, const char *name, StkKind k
   e->symbol = g_strdup(upper);
   e->name = g_strdup(name);
   e->kind = kind;
+  e->range = STK_RANGE_1D;
+  e->show_points = FALSE;
   g_ptr_array_add(self->entries, e);
   self->gen++;
   return TRUE;
@@ -396,6 +398,26 @@ stk_watchlist_move(StkWatchlist *self, guint from, guint to)
   pdata[to] = moved;
   self->gen++;
   g_signal_emit(self, signals[SIGNAL_CHANGED], 0);
+  return TRUE;
+}
+
+/* Documented in stk-watchlist.h. */
+gboolean
+stk_watchlist_set_view(StkWatchlist *self, const char *symbol, StkRange range, gboolean show_points)
+{
+  g_return_val_if_fail(STK_IS_WATCHLIST(self), FALSE);
+  if (range < STK_RANGE_1D || range > STK_RANGE_1Y)
+    return FALSE;
+  gint i = stk_watchlist_index_of(self, symbol);
+  if (i < 0)
+    return FALSE;
+  StkWatchlistEntry *e = g_ptr_array_index(self->entries, (guint)i);
+  show_points = !!show_points;
+  if (e->range == range && e->show_points == show_points)
+    return FALSE;
+  e->range = range;
+  e->show_points = show_points;
+  self->gen++;
   return TRUE;
 }
 
@@ -495,6 +517,19 @@ fill_from_json(StkWatchlist *self, JsonNode *root, guint *dropped, GError **erro
           json_node_get_value_type(kd) == G_TYPE_STRING &&
           stk_kind_from_string(json_node_get_string(kd), &kind))
         ok = append_entry(self, json_node_get_string(sym), json_node_get_string(nm), kind);
+      if (ok) {
+        /* Optional view settings; a missing or malformed value keeps the default. */
+        StkWatchlistEntry *last = g_ptr_array_index(self->entries, self->entries->len - 1);
+        JsonNode *rg = json_object_get_member(o, "range");
+        JsonNode *pt = json_object_get_member(o, "points");
+        StkRange range;
+        if (rg != NULL && JSON_NODE_HOLDS_VALUE(rg) &&
+            json_node_get_value_type(rg) == G_TYPE_STRING &&
+            stk_range_from_string(json_node_get_string(rg), &range))
+          last->range = range;
+        if (pt != NULL && JSON_NODE_HOLDS_VALUE(pt) && json_node_get_value_type(pt) == G_TYPE_BOOLEAN)
+          last->show_points = json_node_get_boolean(pt);
+      }
     }
     if (!ok)
       (*dropped)++;
@@ -587,6 +622,9 @@ serialize_entries(const GPtrArray *entries, gsize *len)
     stk_json_append_string(out, e->name);
     g_string_append(out, ", \"kind\": ");
     stk_json_append_string(out, stk_kind_to_string(e->kind));
+    g_string_append(out, ", \"range\": ");
+    stk_json_append_string(out, stk_range_to_string(e->range));
+    g_string_append(out, e->show_points ? ", \"points\": true" : ", \"points\": false");
     g_string_append_c(out, '}');
   }
   g_string_append(out, entries->len > 0 ? "\n  ]\n}\n" : "]\n}\n");
@@ -761,6 +799,8 @@ stk_watchlist_save_async(StkWatchlist *self, GCancellable *cancellable, GAsyncRe
     copy->symbol = g_strdup(src->symbol);
     copy->name = g_strdup(src->name);
     copy->kind = src->kind;
+    copy->range = src->range;
+    copy->show_points = src->show_points;
     g_ptr_array_add(job->entries, copy);
   }
   job->gen = self->gen;

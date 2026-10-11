@@ -83,8 +83,11 @@ GtkWidget *stk_detail_new(void);
  * @item: (nullable): the item to show, or NULL for the placeholder. A
  *   reference is held until another item is set or the pane is disposed.
  *
- * Renders @item completely and follows its signals. A fund item at range 1D
- * switches the range to 1M (silently, see range-changed).
+ * Renders @item completely and follows its signals. The pane shows the
+ * item's view range (stk_row_item_get_view_range()) and stores a range the
+ * user picks there (stk_row_item_set_view_range()), so every item keeps its
+ * own range. A fund item whose range is 1D shows 1M instead (silently, see
+ * range-changed; the stored range is not rewritten).
  *
  * Preconditions:
  *  - @self satisfies STK_IS_DETAIL() and is not disposed (dispose clears the

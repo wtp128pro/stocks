@@ -459,6 +459,33 @@ store_symbol_at(GListStore *store, guint position)
 }
 
 /**
+ * on_item_view_changed:
+ * @self: (not nullable): the application (the swapped-signal instance).
+ * @item: (not nullable): the item that changed.
+ *
+ * Handler of every item's "changed" signal: when the item's chart range or points/percent choice
+ * differs from what the watchlist holds for its symbol, stores it there and schedules a save.
+ * Quote, sparkline and stale changes find the values equal and do nothing.
+ *
+ * Preconditions:
+ *  - @self is a live application with a watchlist owned by the calling thread; @item is a live
+ *    StkRowItem. The connection is made by sync_items() with g_signal_connect_object() on @self.
+ * Postconditions:
+ *  - the watchlist entry of the item's symbol (if it still exists) holds the item's view range
+ *    and points flag; a save is scheduled iff that changed them.
+ * Thread affinity: main thread.
+ * Ownership: all parameters are borrowed for the call.
+ */
+static void
+on_item_view_changed(StkApp *self, StkRowItem *item)
+{
+  if (stk_watchlist_set_view(self->watchlist, stk_row_item_get_symbol(item),
+                             stk_row_item_get_view_range(item),
+                             stk_row_item_get_show_points(item)))
+    schedule_save(self);
+}
+
+/**
  * sync_items:
  * @self: (not nullable): the application.
  *
@@ -500,6 +527,11 @@ sync_items(StkApp *self)
       continue;
     StkRowItem *item = stk_row_item_new(e->symbol, e->name, e->kind);
     apply_cache(self, item);
+    /* Restore the saved view before the handler below exists, so nothing is written back. */
+    stk_row_item_set_view_range(item, e->range);
+    stk_row_item_set_show_points(item, e->show_points);
+    g_signal_connect_object(item, "changed", G_CALLBACK(on_item_view_changed), self,
+                            G_CONNECT_SWAPPED);
     g_hash_table_insert(self->by_symbol, g_strdup(e->symbol), item);
   }
 

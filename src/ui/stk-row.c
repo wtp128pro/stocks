@@ -146,6 +146,8 @@ struct _StkRowItem {
   StkQuote *quote;
   StkSeries *spark;
   gboolean stale;
+  gboolean show_points; /* the list row shows the change in points instead of percent */
+  StkRange view_range; /* the chart range the user last chose for this item */
   StkRange detail_range;
   StkSeries *detail_series;
 };
@@ -286,6 +288,22 @@ stk_row_item_get_stale(StkRowItem *self)
 {
   g_return_val_if_fail(STK_IS_ROW_ITEM(self), FALSE);
   return self->stale;
+}
+
+/* Documented in stk-row.h. */
+StkRange
+stk_row_item_get_view_range(StkRowItem *self)
+{
+  g_return_val_if_fail(STK_IS_ROW_ITEM(self), STK_RANGE_1D);
+  return self->view_range;
+}
+
+/* Documented in stk-row.h. */
+gboolean
+stk_row_item_get_show_points(StkRowItem *self)
+{
+  g_return_val_if_fail(STK_IS_ROW_ITEM(self), FALSE);
+  return self->show_points;
 }
 
 /* Documented in stk-row.h. */
@@ -432,6 +450,32 @@ stk_row_item_set_stale(StkRowItem *self, gboolean stale)
 
 /* Documented in stk-row.h. */
 gboolean
+stk_row_item_set_show_points(StkRowItem *self, gboolean show_points)
+{
+  g_return_val_if_fail(STK_IS_ROW_ITEM(self), FALSE);
+  show_points = !!show_points;
+  if (self->show_points == show_points)
+    return FALSE;
+  self->show_points = show_points;
+  g_signal_emit(self, item_signals[ITEM_CHANGED], 0);
+  return TRUE;
+}
+
+/* Documented in stk-row.h. */
+gboolean
+stk_row_item_set_view_range(StkRowItem *self, StkRange range)
+{
+  g_return_val_if_fail(STK_IS_ROW_ITEM(self), FALSE);
+  g_return_val_if_fail(range >= STK_RANGE_1D && range <= STK_RANGE_1Y, FALSE);
+  if (self->view_range == range)
+    return FALSE;
+  self->view_range = range;
+  g_signal_emit(self, item_signals[ITEM_CHANGED], 0);
+  return TRUE;
+}
+
+/* Documented in stk-row.h. */
+gboolean
 stk_row_item_set_detail(StkRowItem *self, StkRange range, StkSeries *series)
 {
   g_return_val_if_fail(STK_IS_ROW_ITEM(self), FALSE);
@@ -565,15 +609,16 @@ refresh(StkRow *self)
 
   const StkQuote *q = stk_row_item_get_quote(self->item);
   double price = q != NULL ? q->price : NAN;
-  double pct = q != NULL ? q->change_pct : NAN;
+  gboolean points = stk_row_item_get_show_points(self->item);
+  double change = q != NULL ? (points ? q->change : q->change_pct) : NAN;
 
   gtk_label_set_text(GTK_LABEL(self->symbol_label), stk_row_item_get_symbol(self->item));
   gtk_label_set_text(GTK_LABEL(self->name_label), stk_row_item_get_name(self->item));
   g_autofree char *price_text = stk_format_price(price);
   gtk_label_set_text(GTK_LABEL(self->price_label), price_text);
-  g_autofree char *pct_text = stk_format_percent(pct);
-  gtk_label_set_text(GTK_LABEL(self->change_label), pct_text);
-  set_change_class(self, stk_change_class(pct));
+  g_autofree char *change_text = points ? stk_format_change(change) : stk_format_percent(change);
+  gtk_label_set_text(GTK_LABEL(self->change_label), change_text);
+  set_change_class(self, stk_change_class(change));
   set_spark(self, stk_row_item_get_spark(self->item));
   if (stk_row_item_get_stale(self->item))
     gtk_widget_add_css_class(GTK_WIDGET(self), "stale");
@@ -945,6 +990,37 @@ make_label(const char *css_class, float xalign)
 }
 
 /**
+ * on_change_pressed:
+ * @gesture: the click gesture of the change label.
+ * @n_press: the press count (unused).
+ * @x: pointer x (unused).
+ * @y: pointer y (unused).
+ * @user_data: (not nullable): the StkRow, passed as user data by g_signal_connect_object().
+ *
+ * "pressed" handler of the change label: toggles the bound item between percent and points. The
+ * gesture claims the event sequence so that the list view does not select the row.
+ *
+ * Preconditions:
+ *  - @user_data is a StkRow.
+ * Postconditions:
+ *  - the sequence is claimed; when the row is bound, the item's show-points flag was flipped (the
+ *    row refreshes through the item's "changed" signal).
+ * Thread affinity: main thread only.
+ * Ownership: all parameters are borrowed for the call.
+ */
+static void
+on_change_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data)
+{
+  (void)n_press;
+  (void)x;
+  (void)y;
+  gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  StkRow *self = STK_ROW(user_data);
+  if (self->item != NULL)
+    stk_row_item_set_show_points(self->item, !stk_row_item_get_show_points(self->item));
+}
+
+/**
  * stk_row_init:
  * @self: (not nullable): the new row (zero-filled by GObject).
  *
@@ -995,6 +1071,11 @@ stk_row_init(StkRow *self)
   gtk_label_set_width_chars(GTK_LABEL(self->change_label), 7);
   gtk_widget_set_valign(self->change_label, GTK_ALIGN_CENTER);
   gtk_box_append(GTK_BOX(self), self->change_label);
+  gtk_widget_set_cursor_from_name(self->change_label, "pointer");
+  gtk_widget_set_tooltip_text(self->change_label, "Click to switch between percent and points");
+  GtkGesture *change_click = gtk_gesture_click_new();
+  g_signal_connect_object(change_click, "pressed", G_CALLBACK(on_change_pressed), self, 0);
+  gtk_widget_add_controller(self->change_label, GTK_EVENT_CONTROLLER(change_click));
 
   self->menu_button = gtk_menu_button_new();
   gtk_menu_button_set_child(GTK_MENU_BUTTON(self->menu_button), gtk_label_new("\xe2\x80\xa6"));

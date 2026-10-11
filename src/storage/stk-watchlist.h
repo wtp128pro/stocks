@@ -59,6 +59,8 @@ typedef struct {
   char *symbol; /**< upper-case, satisfies stk_symbol_is_valid() */
   char *name;   /**< valid UTF-8, at most STK_WATCHLIST_MAX_NAME_BYTES bytes, may be "" */
   StkKind kind;
+  StkRange range;      /**< chart range last chosen for it; STK_RANGE_1D by default */
+  gboolean show_points; /**< list row shows the change in points instead of percent */
 } StkWatchlistEntry;
 
 /**
@@ -253,6 +255,34 @@ gboolean stk_watchlist_remove(StkWatchlist *self, const char *symbol);
 gboolean stk_watchlist_move(StkWatchlist *self, guint from, guint to);
 
 /**
+ * stk_watchlist_set_view:
+ * @self: (not nullable): the list; must satisfy STK_IS_WATCHLIST().
+ * @symbol: (nullable): ticker; compared ASCII-case-insensitively.
+ * @range: the chart range to remember (a valid StkRange).
+ * @show_points: whether the list row shows points instead of percent.
+ *
+ * Stores the user's view settings of one entry. They are saved with the list
+ * ("range" and "points" keys of the entry; both optional when loading, a
+ * missing or malformed value keeps the default).
+ *
+ * Preconditions:
+ *  - @self is a valid list (else: critical, FALSE returned); @symbol is NULL,
+ *    NUL-terminated, or at least 16 readable bytes.
+ * Postconditions:
+ *  - on TRUE: the entry holds the new values and the list is dirty. "changed"
+ *    is NOT emitted (neither membership nor order changed); the caller
+ *    schedules the save.
+ *  - on FALSE: nothing is changed.
+ * Thread affinity: the thread that owns the list.
+ * Ownership: @symbol is borrowed for the call only.
+ *
+ * Returns: TRUE iff the values differed. FALSE if @symbol is absent or
+ *   invalid, @range is invalid, or nothing differed.
+ */
+gboolean stk_watchlist_set_view(StkWatchlist *self, const char *symbol, StkRange range,
+                                gboolean show_points);
+
+/**
  * stk_watchlist_load:
  * @self: (not nullable): the list; must satisfy STK_IS_WATCHLIST().
  * @n_dropped: (out) (optional): receives how many stored entries were
@@ -262,7 +292,8 @@ gboolean stk_watchlist_move(StkWatchlist *self, guint from, guint to);
  * @error: (nullable): return location for a GError.
  *
  * Replaces the list with the content of the file at stk_watchlist_get_path()
- * (format: {"version":1,"entries":[{"symbol":..,"name":..,"kind":..}]}).
+ * (format: {"version":1,"entries":[{"symbol":..,"name":..,"kind":..,
+ * "range":..,"points":..}]}; "range" and "points" are optional).
  * Valid entries are kept in file order; invalid ones are dropped and counted.
  *
  * Also removes stale "<path>.stk-tmp-XXXXXX" temporary files (see

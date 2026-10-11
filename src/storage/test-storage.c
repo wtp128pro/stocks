@@ -631,6 +631,66 @@ test_watchlist_roundtrip_unicode(Fixture *f, gconstpointer unused)
 }
 
 static void
+test_watchlist_view_settings(Fixture *f, gconstpointer unused)
+{
+  (void)unused;
+  g_autofree char *path = path_in(f, "view.json");
+  g_autoptr(StkWatchlist) wl = stk_watchlist_new(path);
+  g_assert_true(stk_watchlist_add(wl, "AAPL", "Apple", STK_KIND_STOCK));
+  g_assert_true(stk_watchlist_add(wl, "FXAIX", "Fidelity", STK_KIND_FUND));
+  g_assert_cmpint(stk_watchlist_get_entry(wl, 0)->range, ==, STK_RANGE_1D);
+  g_assert_false(stk_watchlist_get_entry(wl, 0)->show_points);
+
+  GError *err = NULL;
+  g_assert_true(stk_watchlist_save(wl, &err));
+  g_assert_no_error(err);
+  g_assert_false(stk_watchlist_is_dirty(wl));
+
+  /* A change makes the list dirty without emitting "changed"; the same values are no change. */
+  guint changed = 0;
+  g_signal_connect(wl, "changed", G_CALLBACK(on_changed), &changed);
+  g_assert_true(stk_watchlist_set_view(wl, "fxaix", STK_RANGE_3M, TRUE));
+  g_assert_true(stk_watchlist_is_dirty(wl));
+  g_assert_cmpuint(changed, ==, 0);
+  g_assert_false(stk_watchlist_set_view(wl, "FXAIX", STK_RANGE_3M, TRUE));
+  g_assert_false(stk_watchlist_set_view(wl, "NOPE", STK_RANGE_1Y, FALSE));
+  g_assert_false(stk_watchlist_set_view(wl, "AAPL", (StkRange)99, FALSE));
+  g_assert_cmpint(stk_watchlist_get_entry(wl, 0)->range, ==, STK_RANGE_1D);
+
+  /* The settings survive a save/load and belong to their entry when it moves. */
+  g_assert_true(stk_watchlist_move(wl, 1, 0));
+  g_assert_true(stk_watchlist_save(wl, &err));
+  g_assert_no_error(err);
+  g_autoptr(StkWatchlist) wl2 = stk_watchlist_new(path);
+  g_assert_true(stk_watchlist_load(wl2, NULL, &err));
+  g_assert_no_error(err);
+  g_assert_cmpstr(stk_watchlist_get_entry(wl2, 0)->symbol, ==, "FXAIX");
+  g_assert_cmpint(stk_watchlist_get_entry(wl2, 0)->range, ==, STK_RANGE_3M);
+  g_assert_true(stk_watchlist_get_entry(wl2, 0)->show_points);
+  g_assert_cmpint(stk_watchlist_get_entry(wl2, 1)->range, ==, STK_RANGE_1D);
+  g_assert_false(stk_watchlist_get_entry(wl2, 1)->show_points);
+
+  /* Files without the keys (older versions) and malformed values load with the defaults. */
+  put_text(path,
+           "{\"version\":1,\"entries\":["
+           "{\"symbol\":\"A\",\"name\":\"\",\"kind\":\"stock\"},"
+           "{\"symbol\":\"B\",\"name\":\"\",\"kind\":\"stock\",\"range\":\"12M\",\"points\":\"yes\"},"
+           "{\"symbol\":\"C\",\"name\":\"\",\"kind\":\"stock\",\"range\":7,\"points\":1},"
+           "{\"symbol\":\"D\",\"name\":\"\",\"kind\":\"stock\",\"range\":\"1Y\",\"points\":true}]}");
+  guint dropped = 99;
+  g_assert_true(stk_watchlist_load(wl2, &dropped, &err));
+  g_assert_no_error(err);
+  g_assert_cmpuint(dropped, ==, 0);
+  g_assert_cmpuint(stk_watchlist_get_n_entries(wl2), ==, 4);
+  for (guint i = 0; i < 3; i++) {
+    g_assert_cmpint(stk_watchlist_get_entry(wl2, i)->range, ==, STK_RANGE_1D);
+    g_assert_false(stk_watchlist_get_entry(wl2, i)->show_points);
+  }
+  g_assert_cmpint(stk_watchlist_get_entry(wl2, 3)->range, ==, STK_RANGE_1Y);
+  g_assert_true(stk_watchlist_get_entry(wl2, 3)->show_points);
+}
+
+static void
 test_watchlist_load_errors(Fixture *f, gconstpointer unused)
 {
   (void)unused;
@@ -2035,6 +2095,7 @@ main(int argc, char **argv)
   g_test_add_func("/watchlist/capacity", test_watchlist_capacity);
   g_test_add_func("/watchlist/default-path", test_watchlist_default_path);
   ADD_FIXTURE("/watchlist/roundtrip-unicode", test_watchlist_roundtrip_unicode);
+  ADD_FIXTURE("/watchlist/view-settings", test_watchlist_view_settings);
   ADD_FIXTURE("/watchlist/load-errors", test_watchlist_load_errors);
   ADD_FIXTURE("/watchlist/load-partial", test_watchlist_load_partial);
   ADD_FIXTURE("/watchlist/save-failure", test_watchlist_save_failure);

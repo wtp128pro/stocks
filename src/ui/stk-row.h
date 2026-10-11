@@ -23,7 +23,8 @@
  * StkRow
  * ------
  * The widget bound to an item by the list view's factory: symbol, name,
- * price, change %, StkSparkline and a "..." menu button (Move up, Move down,
+ * price, change (percent, or points after a click on it; the click does not
+ * select the row), StkSparkline and a "..." menu button (Move up, Move down,
  * Remove) with the CSS class "stk-row". The row is also a drag source and drop
  * target: dropping another row on it asks to move that row to this row's
  * position. The row never touches the watchlist: it only emits requests that
@@ -298,6 +299,38 @@ StkSeries *stk_row_item_get_spark(StkRowItem *self);
 gboolean stk_row_item_get_stale(StkRowItem *self);
 
 /**
+ * stk_row_item_get_show_points:
+ * @self: (not nullable): the item; must satisfy STK_IS_ROW_ITEM().
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_ROW_ITEM() (else: critical, FALSE returned).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ *
+ * Returns: whether the list row shows the change in points (TRUE) or in
+ *   percent (FALSE, the default).
+ */
+gboolean stk_row_item_get_show_points(StkRowItem *self);
+
+/**
+ * stk_row_item_get_view_range:
+ * @self: (not nullable): the item; must satisfy STK_IS_ROW_ITEM().
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_ROW_ITEM() (else: critical, STK_RANGE_1D returned).
+ * Postconditions:
+ *  - no state is changed.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ *
+ * Returns: the chart range the detail pane shows for this item (STK_RANGE_1D
+ *   by default; a fund still shows 1M while this is 1D).
+ */
+StkRange stk_row_item_get_view_range(StkRowItem *self);
+
+/**
  * stk_row_item_get_detail_range:
  * @self: (not nullable): the item; must satisfy STK_IS_ROW_ITEM().
  *
@@ -389,6 +422,43 @@ gboolean stk_row_item_set_spark(StkRowItem *self, StkSeries *series);
  * Returns: TRUE (and "changed" emitted) iff it differs.
  */
 gboolean stk_row_item_set_stale(StkRowItem *self, gboolean stale);
+
+/**
+ * stk_row_item_set_show_points:
+ * @self: (not nullable): the item; must satisfy STK_IS_ROW_ITEM().
+ * @show_points: TRUE to show the change in points in the list row, FALSE for
+ *   percent (any non-zero value counts as TRUE).
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_ROW_ITEM() (else: critical, FALSE returned).
+ * Postconditions:
+ *  - the flag is stored as TRUE or FALSE; "changed" was emitted after it
+ *    was updated iff it differed. The flag is not persisted.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ *
+ * Returns: TRUE (and "changed" emitted) iff it differs.
+ */
+gboolean stk_row_item_set_show_points(StkRowItem *self, gboolean show_points);
+
+/**
+ * stk_row_item_set_view_range:
+ * @self: (not nullable): the item; must satisfy STK_IS_ROW_ITEM().
+ * @range: the chart range the user chose for this item (a valid StkRange).
+ *
+ * Preconditions:
+ *  - @self satisfies STK_IS_ROW_ITEM() and @range is valid (else: critical,
+ *    FALSE returned).
+ * Postconditions:
+ *  - the range is stored; "changed" was emitted after it was updated iff it
+ *    differed. Unlike the detail range this is a preference of the item, not
+ *    the range of the series currently held.
+ * Thread affinity: main thread only.
+ * Ownership: none (no pointers besides @self).
+ *
+ * Returns: TRUE (and "changed" emitted) iff it differs.
+ */
+gboolean stk_row_item_set_view_range(StkRowItem *self, StkRange range);
 
 /**
  * stk_row_item_set_detail:
