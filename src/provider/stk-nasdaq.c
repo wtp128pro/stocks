@@ -1004,11 +1004,21 @@ parse_quote_impl(const guint8 *data, gsize len, const char *symbol, StkKind kind
   quote->price = price;
   quote->market_open = market_open;
   if (block != NULL) {
+    /* An unchanged quote (deltaIndicator "unch", e.g. a fund whose NAV did
+     * not move) has empty netChange and percentageChange: zero, not unknown. */
+    const char *delta = member_string(block, "deltaIndicator");
+    gboolean unchanged = delta != NULL && g_ascii_strcasecmp(delta, "unch") == 0;
+    const char *net = member_string(block, "netChange");
+    const char *pct = member_string(block, "percentageChange");
     double v;
-    if (stk_parse_change(member_string(block, "netChange"), &v) == STK_PARSE_OK)
+    if (stk_parse_change(net, &v) == STK_PARSE_OK)
       quote->change = v;
-    if (stk_parse_percent(member_string(block, "percentageChange"), &v) == STK_PARSE_OK)
+    else if (unchanged && (net == NULL || net[0] == '\0'))
+      quote->change = 0.0;
+    if (stk_parse_percent(pct, &v) == STK_PARSE_OK)
       quote->change_pct = v;
+    else if (unchanged && (pct == NULL || pct[0] == '\0'))
+      quote->change_pct = 0.0;
     gint64 ms;
     if (parse_quote_timestamp(member_string(block, "lastTradeTimestamp"), &ms))
       quote->as_of_ms = ms;

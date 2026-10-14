@@ -38,6 +38,11 @@
   <url type="bugtracker">https://github.com/wtp128pro/stocks/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.3" date="2026-10-14">
+      <description>
+        <p>A mutual fund whose NAV did not change from the previous day now shows a change of 0.00 (0.00%) instead of a dash, which looked like the quote had not been updated.</p>
+      </description>
+    </release>
     <release version="0.2.2" date="2026-10-14">
       <description>
         <p>Each row of the watchlist now shows the chart range chosen for that instrument (1D, 1M, 3M, 6M or 1Y) as a pill label in place of the one-month sparkline.</p>

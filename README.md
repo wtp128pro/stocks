@@ -105,20 +105,20 @@ Fedora 44 (`x86_64` and source) only, because the packages are built there.
 
 ### From a downloaded RPM (Fedora)
 
-Download `stocks-0.2.2-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
+Download `stocks-0.2.3-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
 [GitHub releases](https://github.com/wtp128pro/stocks/releases) page, check the
 signature and install:
 
 ```sh
 gpg --show-keys RPM-GPG-KEY-stocks            # compare the fingerprint above
 sudo rpm --import RPM-GPG-KEY-stocks
-rpm -K stocks-0.2.2-1.*.rpm                   # must say "digests signatures OK"
-sudo dnf install ./stocks-0.2.2-1.*.rpm
+rpm -K stocks-0.2.3-1.*.rpm                   # must say "digests signatures OK"
+sudo dnf install ./stocks-0.2.3-1.*.rpm
 ```
 
 `rpm -K` also exits 0 for an unsigned package, which it reports as just
 `digests OK`; look for `signatures OK`. The release also has `SHA256SUMS` and
-detached signatures (`SHA256SUMS.asc`, `stocks-0.2.2.tar.gz.asc`):
+detached signatures (`SHA256SUMS.asc`, `stocks-0.2.3.tar.gz.asc`):
 
 ```sh
 gpg --import RPM-GPG-KEY-stocks
@@ -128,7 +128,7 @@ gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
 It installs the `stocks` command, a desktop entry (Office / Finance), an
 AppStream metainfo file and a full-colour and a symbolic icon, and needs no
 runtime dependency beyond the libraries `dnf` resolves from the binary and
-`hicolor-icon-theme`. The source RPM (`stocks-0.2.2-1.*.src.rpm`) is on the
+`hicolor-icon-theme`. The source RPM (`stocks-0.2.3-1.*.src.rpm`) is on the
 same page; see "Packaging notes" below to build it yourself.
 
 ### Build from source
@@ -747,11 +747,11 @@ project and are covered by the same licence as the program.
 The package is meant to be picked up by Fedora, and the repository carries
 what a reviewer needs:
 
-- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.2,
+- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.3,
   `License: GPL-3.0-or-later AND CC0-1.0`, `URL` https://github.com/wtp128pro/stocks).
 - Source: `Source0` is `%{url}/archive/v%{version}/%{name}-%{version}.tar.gz`,
-  i.e. GitHub's archive of the tag `v0.2.2`, named `stocks-0.2.2.tar.gz`, whose
-  top-level directory is `stocks-0.2.2/` (the spec uses `%autosetup`).
+  i.e. GitHub's archive of the tag `v0.2.3`, named `stocks-0.2.3.tar.gz`, whose
+  top-level directory is `stocks-0.2.3/` (the spec uses `%autosetup`).
 - Build with Meson (`%meson`, `%meson_build`, `%meson_install`); no
   patches, no bundled libraries, no Internet access at build or test time.
   `BuildRequires` (all resolve with `rpm -q --whatprovides`): `gcc`, `meson`,
@@ -772,7 +772,7 @@ user, mount and network namespace (explained below):
 ```sh
 top=/var/tmp/stocks-rpmbuild
 mkdir -p "$top/SOURCES"
-git archive --prefix=stocks-0.2.2/ -o "$top/SOURCES/stocks-0.2.2.tar.gz" HEAD
+git archive --prefix=stocks-0.2.3/ -o "$top/SOURCES/stocks-0.2.3.tar.gz" HEAD
 unshare -rmn sh -c 'ip link set lo up && mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $1" packaging/rpm/stocks.spec' sh "$top"
 rpmlint packaging/rpm/stocks.spec "$top"/RPMS/*/stocks-*.rpm "$top"/SRPMS/stocks-*.src.rpm
 ```

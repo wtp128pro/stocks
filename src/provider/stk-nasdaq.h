@@ -288,7 +288,8 @@ char *stk_nasdaq_search_url(const char *base_url, const char *text, GError **err
  * preferred block has no usable price the other one is used. From the
  * chosen block: lastSalePrice -> price,
  * netChange -> change, percentageChange -> change_pct (NAN when "N/A",
- * missing or malformed), isRealTime -> is_realtime,
+ * missing or malformed, except that a missing or empty one is 0 when the
+ * block's deltaIndicator is "unch"), isRealTime -> is_realtime,
  * lastTradeTimestamp ("Oct 8, 2026 7:25 PM ET", "Closed at Oct 8, 2026 4:00
  * PM ET" or date only "Oct 8, 2026") -> as_of_ms (a date without a time
  * maps to 12:00 America/New_York; 0 if unparsable), currency (only a

@@ -136,6 +136,22 @@ test_quote_fund_fixture(void)
 }
 
 static void
+test_quote_fund_unchanged_fixture(void)
+{
+  gsize len;
+  g_autofree char *body = load_fixture("quote_fund_unch.json", &len);
+  g_autoptr(GError) error = NULL;
+  g_autoptr(StkQuote) q =
+      stk_nasdaq_parse_quote((const guint8 *)body, len, "FFTHX", STK_KIND_FUND, &error);
+  g_assert_no_error(error);
+  g_assert_cmpfloat_with_epsilon(q->price, 18.79, 1e-9);
+  /* "unch" with empty netChange / percentageChange: the NAV did not move. */
+  g_assert_cmpfloat(q->change, ==, 0.0);
+  g_assert_cmpfloat(q->change_pct, ==, 0.0);
+  g_assert_cmpint(q->as_of_ms, ==, utc_ms(2026, 10, 14, 16, 0));
+}
+
+static void
 test_quote_market_open_prefers_primary(void)
 {
   g_autoptr(GError) error = NULL;
@@ -211,6 +227,25 @@ test_quote_fields_missing_or_na(void)
   g_assert_cmpint(q->as_of_ms, ==, 0);
   g_assert_false(q->is_realtime);
   g_assert_cmpstr(q->currency, ==, "USD");
+  g_clear_pointer(&q, stk_quote_free);
+
+  /* Empty change fields are zero only when the block says "unch"; "N/A" stays unknown. */
+  q = quote_of("{\"data\":{\"primaryData\":{\"lastSalePrice\":\"$5.00\",\"netChange\":\"\","
+               "\"percentageChange\":\"\",\"deltaIndicator\":\"up\"}},"
+               "\"status\":{\"rCode\":200}}",
+               &error);
+  g_assert_no_error(error);
+  g_assert_true(isnan(q->change));
+  g_assert_true(isnan(q->change_pct));
+  g_clear_pointer(&q, stk_quote_free);
+
+  q = quote_of("{\"data\":{\"primaryData\":{\"lastSalePrice\":\"$5.00\",\"netChange\":\"N/A\","
+               "\"deltaIndicator\":\"UNCH\"}},"
+               "\"status\":{\"rCode\":200}}",
+               &error);
+  g_assert_no_error(error);
+  g_assert_true(isnan(q->change));
+  g_assert_cmpfloat(q->change_pct, ==, 0.0); /* missing */
 }
 
 static void
@@ -2190,6 +2225,7 @@ main(int argc, char **argv)
   g_test_add_func("/nasdaq/quote/stock-fixture", test_quote_stock_fixture);
   g_test_add_func("/nasdaq/quote/etf-fixture", test_quote_etf_fixture);
   g_test_add_func("/nasdaq/quote/fund-fixture", test_quote_fund_fixture);
+  g_test_add_func("/nasdaq/quote/fund-unchanged", test_quote_fund_unchanged_fixture);
   g_test_add_func("/nasdaq/quote/market-open", test_quote_market_open_prefers_primary);
   g_test_add_func("/nasdaq/quote/missing-or-na", test_quote_fields_missing_or_na);
   g_test_add_func("/nasdaq/quote/timestamps", test_quote_timestamps);
