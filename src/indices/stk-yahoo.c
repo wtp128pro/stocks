@@ -100,6 +100,34 @@ check_symbol_kind(const char *symbol, StkKind kind, GError **error)
   return TRUE;
 }
 
+/**
+ * format_chart_url:
+ * @base_url: (not nullable): origin, inserted verbatim
+ * @symbol: (not nullable): a symbol that satisfies stk_symbol_is_valid()
+ * @range_param: (not nullable): value of the range query parameter
+ * @interval_param: (not nullable): value of the interval query parameter
+ *
+ * Formats the chart URL of @symbol (upper-cased and percent-encoded into the path).
+ *
+ * Preconditions:
+ *  - all arguments are NUL-terminated; @symbol was checked by check_symbol_kind().
+ * Postconditions:
+ *  - nothing is modified.
+ * Thread affinity: any thread (pure)
+ * Ownership: the arguments stay with the caller; the caller owns the returned string.
+ *
+ * Returns: (transfer full): "<base>/v8/finance/chart/SYM?range=R&interval=I".
+ */
+static char *
+format_chart_url(const char *base_url, const char *symbol, const char *range_param,
+                 const char *interval_param)
+{
+  g_autofree char *upper = g_ascii_strup(symbol, -1);
+  g_autofree char *escaped = g_uri_escape_string(upper, NULL, FALSE);
+  return g_strdup_printf("%s/v8/finance/chart/%s?range=%s&interval=%s", base_url, escaped,
+                         range_param, interval_param);
+}
+
 /* Documented in stk-yahoo.h. */
 char *
 stk_yahoo_chart_url(const char *base_url, const char *symbol, StkKind kind, StkRange range,
@@ -117,10 +145,17 @@ stk_yahoo_chart_url(const char *base_url, const char *symbol, StkKind kind, StkR
   /* range_is_valid() admits exactly the indices 0..4 (1D .. 1Y): the tables must cover them. */
   G_STATIC_ASSERT(STK_RANGE_1D == 0 && (gsize)STK_RANGE_1Y + 1 == G_N_ELEMENTS(range_param) &&
                   G_N_ELEMENTS(interval_param) == G_N_ELEMENTS(range_param));
-  g_autofree char *upper = g_ascii_strup(symbol, -1);
-  g_autofree char *escaped = g_uri_escape_string(upper, NULL, FALSE);
-  return g_strdup_printf("%s/v8/finance/chart/%s?range=%s&interval=%s", base_url, escaped,
-                         range_param[range], interval_param[range]);
+  return format_chart_url(base_url, symbol, range_param[range], interval_param[range]);
+}
+
+/* Documented in stk-yahoo.h. */
+char *
+stk_yahoo_quote_url(const char *base_url, const char *symbol, StkKind kind, GError **error)
+{
+  g_return_val_if_fail(base_url != NULL, NULL);
+  if (!check_symbol_kind(symbol, kind, error))
+    return NULL;
+  return format_chart_url(base_url, symbol, "5d", "1d");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -407,31 +442,69 @@ load_chart(const guint8 *data, gsize len, JsonObject **result, JsonObject **meta
 /* ------------------------------------------------------------------------ */
 
 /**
- * previous_close_of:
- * @meta: (nullable): the chart "meta" object, or NULL
+ * close_before:
+ * @result: (not nullable): chart.result[0] of a daily (interval=1d) response
+ * @day: (not nullable): New York date of a trading day
  *
- * Previous close of a chart response: meta.previousClose, else meta.chartPreviousClose, taking the
- * first that is a finite number > 0.
+ * Previous close of the session on @day, read from the daily samples: of the samples dated (New
+ * York date of the timestamp) before @day, only those of the LATEST such date count, and the close
+ * of the latest of them with a usable close is returned. A date whose samples all lack a usable
+ * close yields NAN rather than the close of an earlier date, which would belong to an older
+ * session. Samples with an unusable timestamp are ignored; timestamp[] and close[] are paired by
+ * index up to the shorter length.
+ *
+ * meta.previousClose is not used: Yahoo has served it stale (on 2026-10-13 the ^GSPC and ^DJI
+ * responses gave the close of 2026-10-09 although 2026-10-12 was a full session, which their own
+ * daily samples showed).
  *
  * Preconditions:
- *  - @meta is NULL or a valid JsonObject.
+ *  - @result is a valid JsonObject; @day is a valid GDate.
  * Postconditions:
  *  - nothing is modified.
- * Thread affinity: any thread (pure)
- * Ownership: @meta stays with its tree; nothing is retained.
+ * Thread affinity: any thread (pure; the only shared state is a read-only, once-initialised time
+ *   zone)
+ * Ownership: @result stays with its tree; @day stays with the caller; nothing is retained.
  *
- * Returns: the previous close (finite, > 0), or NAN if neither member is usable.
+ * Returns: the previous close (finite, > 0), or NAN if there is none.
  */
 static double
-previous_close_of(JsonObject *meta)
+close_before(JsonObject *result, const GDate *day)
 {
-  static const char *const names[] = {"previousClose", "chartPreviousClose"};
-  for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
-    double p;
-    if (member_number(meta, names[i], &p) && p > 0.0)
-      return p;
+  JsonArray *timestamps = member_array(result, "timestamp");
+  JsonArray *quotes = member_array(member_object(result, "indicators"), "quote");
+  JsonNode *q0 = quotes != NULL && json_array_get_length(quotes) > 0 ? json_array_get_element(quotes, 0)
+                                                                      : NULL;
+  JsonArray *closes = member_array(q0 != NULL && JSON_NODE_HOLDS_OBJECT(q0) ? json_node_get_object(q0) : NULL,
+                                   "close");
+  if (timestamps == NULL || closes == NULL)
+    return NAN;
+  guint n = MIN(json_array_get_length(timestamps), json_array_get_length(closes));
+
+  GDate best_date; /* latest date before @day seen so far; valid once have_date is TRUE */
+  gboolean have_date = FALSE;
+  gint64 best_s = 0; /* raw timestamp of the sample that gave best */
+  double best = NAN;
+  for (guint i = 0; i < n; i++) {
+    gint64 t_s;
+    GDate date;
+    if (!node_epoch_s(json_array_get_element(timestamps, i), &t_s) ||
+        !stk_market_local_date(t_s * 1000, &date) || g_date_compare(&date, day) >= 0)
+      continue;
+    int cmp = have_date ? g_date_compare(&date, &best_date) : 1;
+    if (cmp < 0)
+      continue;
+    if (cmp > 0) { /* a later date: what an earlier one gave no longer counts */
+      best_date = date;
+      have_date = TRUE;
+      best = NAN;
+    }
+    double v;
+    if (node_number(json_array_get_element(closes, i), &v) && v > 0.0 && (isnan(best) || t_s >= best_s)) {
+      best = v;
+      best_s = t_s;
+    }
   }
-  return NAN;
+  return best;
 }
 
 /**
@@ -498,26 +571,62 @@ stk_yahoo_parse_quote(const guint8 *data, gsize len, const char *symbol, StkKind
 
   StkQuote *quote = stk_quote_new(symbol, name, kind, currency);
   quote->price = price;
-  double prev = previous_close_of(meta);
-  if (!isnan(prev)) {
-    double change = price - prev;
-    double pct = change / prev * 100.0;
-    if (isfinite(change) && isfinite(pct)) { /* a tiny previous close can overflow */
-      quote->change = change;
-      quote->change_pct = pct;
+  gint64 as_of_s;
+  GDate session;
+  if (node_epoch_s(json_object_get_member(meta, "regularMarketTime"), &as_of_s)) {
+    quote->as_of_ms = as_of_s * 1000;
+    /* The price belongs to the session of regularMarketTime's date; its change is measured
+     * against the close of the session before it. */
+    double prev = stk_market_local_date(quote->as_of_ms, &session) ? close_before(result, &session)
+                                                                   : NAN;
+    if (!isnan(prev)) {
+      double change = price - prev;
+      double pct = change / prev * 100.0;
+      if (isfinite(change) && isfinite(pct)) { /* a tiny previous close can overflow */
+        quote->change = change;
+        quote->change_pct = pct;
+      }
     }
   }
-  gint64 as_of_s;
-  if (node_epoch_s(json_object_get_member(meta, "regularMarketTime"), &as_of_s))
-    quote->as_of_ms = as_of_s * 1000;
   return quote;
 }
 
 /* Documented in stk-yahoo.h. */
-StkSeries *
-stk_yahoo_parse_series(const guint8 *data, gsize len, StkRange range, GError **error)
+double
+stk_yahoo_parse_prev_close(const guint8 *data, gsize len, gint64 day_ms, GError **error)
 {
-  g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+  g_return_val_if_fail(error == NULL || *error == NULL, NAN);
+  JsonObject *result = NULL, *meta = NULL;
+  g_autoptr(JsonParser) parser = load_chart(data, len, &result, &meta, error);
+  if (parser == NULL)
+    return NAN;
+  GDate day;
+  return stk_market_local_date(day_ms, &day) ? close_before(result, &day) : NAN;
+}
+
+/**
+ * parse_series:
+ * @data: (nullable): chart response body fetched for @range
+ * @len: body length
+ * @range: the requested range
+ * @day_ms: (out) (optional): for STK_RANGE_1D, receives the start of the regular session the
+ *   response describes (epoch ms); untouched for daily ranges and on failure
+ * @error: (nullable): return location for a #GError
+ *
+ * stk_yahoo_parse_series() that also reports the trading day of a 1D response, which the request
+ * layer needs to ask for that day's previous close.
+ *
+ * Preconditions / postconditions / errors: those of stk_yahoo_parse_series(); @day_ms is NULL or
+ *   writable.
+ * Thread affinity: any thread (pure; the only shared state is a read-only, once-initialised time
+ *   zone)
+ * Ownership: @data stays with the caller and is not retained; the caller owns the returned series.
+ *
+ * Returns: (transfer full) (nullable): the series, or NULL with @error set.
+ */
+static StkSeries *
+parse_series(const guint8 *data, gsize len, StkRange range, gint64 *day_ms, GError **error)
+{
   if (!range_is_valid(range)) {
     g_set_error_literal(error, STK_ERROR, STK_ERROR_INVALID_ARG, "invalid range");
     return NULL;
@@ -529,7 +638,6 @@ stk_yahoo_parse_series(const guint8 *data, gsize len, StkRange range, GError **e
 
   const gboolean intraday = range == STK_RANGE_1D;
   gint64 start_ms = 0, end_ms = 0;
-  double prev_close = NAN;
   if (intraday) {
     JsonObject *regular = member_object(member_object(meta, "currentTradingPeriod"), "regular");
     gint64 start_s, end_s;
@@ -541,7 +649,6 @@ stk_yahoo_parse_series(const guint8 *data, gsize len, StkRange range, GError **e
     }
     start_ms = start_s * 1000;
     end_ms = end_s * 1000;
-    prev_close = previous_close_of(meta);
   }
 
   /* timestamp absent or null: no samples (a valid, empty series). */
@@ -604,13 +711,25 @@ stk_yahoo_parse_series(const guint8 *data, gsize len, StkRange range, GError **e
     g_array_append_val(points, p);
   }
 
-  StkSeries *series = stk_series_new(range, prev_close, points->len);
+  /* prev_close stays NAN: meta.previousClose can be stale (see close_before()) and the
+   * chartPreviousClose of a daily response is the close before the range start. */
+  StkSeries *series = stk_series_new(range, NAN, points->len);
   for (guint i = 0; i < points->len; i++) {
     const StkPoint *p = &g_array_index(points, StkPoint, i);
     /* Points are collected in ascending order with finite values: the append cannot fail. */
     (void)stk_series_append(series, p->t_ms, p->v);
   }
+  if (intraday && day_ms != NULL)
+    *day_ms = start_ms;
   return series;
+}
+
+/* Documented in stk-yahoo.h. */
+StkSeries *
+stk_yahoo_parse_series(const guint8 *data, gsize len, StkRange range, GError **error)
+{
+  g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+  return parse_series(data, len, range, NULL, error);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -855,9 +974,16 @@ typedef enum { OP_QUOTE, OP_SERIES } OpType;
  * owned by the GTask (task data, freed by op_free() when the task is finalised) and used from the
  * main thread only.
  *
- * Ownership of the members: url, symbol (a copy; set for quotes and series alike, used only by
- * quotes), user_cancellable (a strong reference, nullable) and owner (a strong reference; the Op
- * counts in owner->inflight from op_new() to op_free()) are owned by the Op. cancel_watch is owned
+ * A STK_RANGE_1D series is two requests made one after the other: the chart (url), then the quote
+ * URL (next_url) for the previous close of the chart's trading day. Between the two, series holds
+ * the parsed chart and day_ms its trading day; series != NULL is what tells that the second
+ * request is the current one.
+ *
+ * Ownership of the members: url, next_url (NULL except for the first request of a 1D series),
+ * symbol (a copy; set for quotes and series alike, used only by quotes), series (NULL until the
+ * chart of a 1D series has been parsed), user_cancellable (a strong reference, nullable) and owner
+ * (a strong reference; the Op counts in owner->inflight from op_new() to op_free()) are owned by
+ * the Op. cancel_watch is owned
  * by the Op between enqueue() and the moment the task leaves the queue; the per-attempt members are
  * owned by the Op between attempt_start() and attempt_cleanup().
  *
@@ -878,10 +1004,13 @@ typedef enum { OP_QUOTE, OP_SERIES } OpType;
  */
 typedef struct {
   OpType type;
-  char *url;
+  char *url;      /* URL of the current request */
+  char *next_url; /* 1D series: the quote URL, until it becomes url; else NULL */
   char *symbol;   /* owned copy; used by quotes only */
   StkKind kind;   /* quote only */
   StkRange range; /* series only */
+  StkSeries *series; /* 1D series: the parsed chart, while its previous close is fetched */
+  gint64 day_ms;     /* 1D series: start of the chart's regular session */
   GCancellable *user_cancellable; /* the caller's (nullable), strong ref */
   StkYahoo *owner;                /* strong ref; this Op counts in owner->inflight */
 
@@ -908,6 +1037,7 @@ typedef struct {
 static char tag_quote, tag_series, tag_search;
 
 static void pump(StkYahoo *self);
+static void enqueue(GTask *task, gboolean at_head);
 
 /**
  * source_clear:
@@ -993,8 +1123,8 @@ attempt_cleanup(Op *op)
  *  - all members are released; owner->inflight is decremented once; the owner reference taken in
  *    op_new() is dropped (which may finalise the provider). @data is invalid afterwards.
  * Thread affinity: main thread only (the thread running the GLib main context)
- * Ownership: takes ownership of @data and of every member of the Op (url, symbol, user_cancellable
- *   ref, owner ref, cancel_watch and per-attempt state).
+ * Ownership: takes ownership of @data and of every member of the Op (url, next_url, symbol, series,
+ *   user_cancellable ref, owner ref, cancel_watch and per-attempt state).
  */
 static void
 op_free(gpointer data)
@@ -1006,7 +1136,9 @@ op_free(gpointer data)
   op->owner->inflight--;
   g_object_unref(op->owner);
   g_free(op->url);
+  g_free(op->next_url);
   g_free(op->symbol);
+  g_clear_pointer(&op->series, stk_series_unref);
   g_free(op);
 }
 
@@ -1051,18 +1183,25 @@ series_destroy(gpointer series)
 /**
  * op_complete:
  * @task: (not nullable): the operation's task; its task data is an Op
- * @body: (not nullable): the complete response body
+ * @body: (not nullable): the complete response body of the current request
  *
- * Parses the finished body and completes @task with the result (or the parse error).
+ * Parses the finished body and completes @task with the result (or the parse error), except after
+ * the chart of a 1D series, whose previous close is requested next.
  *
  * Preconditions:
  *  - @task has an Op as task data that has not been returned yet; @body is a GBytes of at most
  *    STK_YAHOO_MAX_BODY_BYTES bytes (on_read() fails the attempt instead of completing when the
- *    body exceeds the cap; load_chart() re-checks the length).
+ *    body exceeds the cap; load_chart() re-checks the length). Nothing is on the wire and the
+ *    caller holds a reference to @task for the duration of the call (on_read()).
  * Postconditions:
- *  - @task is completed exactly once: with a quote (OP_QUOTE) or a series (OP_SERIES), or with the
- *    parser's error (every NULL return of the parsers sets the error). GTask may invoke the
- *    caller's callback synchronously from inside this call.
+ *  - the chart of a 1D series parsed successfully: op->series holds it, op->day_ms its trading day,
+ *    op->url is the former next_url (next_url is NULL), op->attempt is 0 and the task is queued at
+ *    the head (enqueue() pumps; the task completes later).
+ *  - otherwise @task is completed exactly once: with a quote (OP_QUOTE), a series (OP_SERIES; after
+ *    the second request of a 1D series, the held chart with prev_close set from @body, NAN when
+ *    @body has none or does not parse), or with the parser's error (every NULL return of the
+ *    parsers sets the error). GTask may invoke the caller's callback synchronously from inside
+ *    this call.
  * Thread affinity: main thread only (the thread running the GLib main context)
  * Ownership: @task and @body stay with the caller; the result is handed to @task, which owns it
  *   until the caller propagates it.
@@ -1079,10 +1218,22 @@ op_complete(GTask *task, GBytes *body)
     StkQuote *quote = stk_yahoo_parse_quote(data, len, op->symbol, op->kind, &error);
     if (quote != NULL)
       g_task_return_pointer(task, quote, quote_destroy);
+  } else if (op->series != NULL) {
+    /* The second request of a 1D series. The chart was parsed here and is not shared yet, so its
+     * prev_close may be written; a body without a usable previous close leaves it NAN. */
+    op->series->prev_close = stk_yahoo_parse_prev_close(data, len, op->day_ms, NULL);
+    g_task_return_pointer(task, g_steal_pointer(&op->series), series_destroy);
   } else {
-    StkSeries *series = stk_yahoo_parse_series(data, len, op->range, &error);
-    if (series != NULL)
+    StkSeries *series = parse_series(data, len, op->range, &op->day_ms, &error);
+    if (series != NULL && op->next_url != NULL) {
+      op->series = series;
+      g_free(op->url);
+      op->url = g_steal_pointer(&op->next_url);
+      op->attempt = 0; /* the second request has retries of its own */
+      enqueue(task, TRUE);
+    } else if (series != NULL) {
       g_task_return_pointer(task, series, series_destroy);
+    }
   }
   if (error != NULL)
     g_task_return_error(task, error);
@@ -1153,16 +1304,15 @@ normalize_error(Op *op, GError *err)
   return out;
 }
 
-static void enqueue(GTask *task, gboolean at_head);
-
 /**
  * fail_attempt:
  * @task: (not nullable): the operation's task, whose current attempt failed
  * @err: (not nullable) (transfer full): the failure of the attempt
  *
  * Ends the current attempt with @err: queues a retry when the failure class allows it (network,
- * timeout and HTTP 5xx, at most STK_YAHOO_MAX_RETRIES times), otherwise completes @task with the
- * normalised error.
+ * timeout and HTTP 5xx, at most STK_YAHOO_MAX_RETRIES times per request), otherwise completes @task
+ * with the normalised error; a final failure of the second request of a 1D series that is not a
+ * cancellation completes @task with the held chart instead (prev_close NAN).
  *
  * Preconditions:
  *  - the attempt is in progress and its callback holds a task reference for the duration of the
@@ -1170,8 +1320,9 @@ static void enqueue(GTask *task, gboolean at_head);
  *    stay alive until this function returns, including across a synchronously invoked callback.
  * Postconditions:
  *  - the per-attempt state is released and on_wire is FALSE. On a retry op->attempt is incremented
- *    and the task is queued at the head (enqueue() pumps); otherwise the task is completed with
- *    the error and pump() runs so the next operation can start.
+ *    and the task is queued at the head (enqueue() pumps); otherwise the task is completed (with
+ *    the error, or with the held chart as above) and pump() runs so the next operation can
+ *    start.
  * Thread affinity: main thread only (the thread running the GLib main context)
  * Ownership: takes ownership of @err; @task stays with the caller.
  */
@@ -1191,6 +1342,11 @@ fail_attempt(GTask *task, GError *err)
     g_error_free(final);
     op->attempt++;
     enqueue(task, TRUE); /* pumps */
+  } else if (op->series != NULL && !g_error_matches(final, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+    /* The previous close of a 1D series is optional: the chart is delivered without it. */
+    g_error_free(final);
+    g_task_return_pointer(task, g_steal_pointer(&op->series), series_destroy);
+    pump(self);
   } else {
     g_task_return_error(task, final);
     pump(self);
@@ -1629,6 +1785,8 @@ enqueue(GTask *task, gboolean at_head)
  * @owner: (not nullable): the provider
  * @type: the operation type
  * @url: (transfer full): the request URL, taken
+ * @next_url: (transfer full) (nullable): the URL of a second request (1D series: the quote URL),
+ *   taken
  * @symbol: (not nullable): the symbol, copied
  * @kind: the requested kind
  * @range: the requested range
@@ -1640,21 +1798,22 @@ enqueue(GTask *task, gboolean at_head)
  *  - @owner is a live StkYahoo; @url is a g_malloc()-allocated string; @symbol is NUL-terminated
  *    (the callers pass a symbol that stk_yahoo_chart_url() accepted).
  * Postconditions:
- *  - the new Op holds references to @owner and @user_cancellable and owns @url and the symbol copy;
- *    owner->inflight is incremented once (undone by op_free()).
+ *  - the new Op holds references to @owner and @user_cancellable and owns @url, @next_url and the
+ *    symbol copy; owner->inflight is incremented once (undone by op_free()).
  * Thread affinity: main thread only (the thread running the GLib main context)
- * Ownership: takes ownership of @url; copies @symbol; takes references on @owner and
+ * Ownership: takes ownership of @url and @next_url; copies @symbol; takes references on @owner and
  *   @user_cancellable; the returned Op is owned by the caller (op_start() hands it to the task).
  *
  * Returns: (transfer full): the new Op.
  */
 static Op *
-op_new(StkYahoo *owner, OpType type, char *url, const char *symbol, StkKind kind, StkRange range,
-       GCancellable *user_cancellable)
+op_new(StkYahoo *owner, OpType type, char *url, char *next_url, const char *symbol, StkKind kind,
+       StkRange range, GCancellable *user_cancellable)
 {
   Op *op = g_new0(Op, 1);
   op->type = type;
   op->url = url;
+  op->next_url = next_url;
   op->symbol = g_strdup(symbol);
   op->kind = kind;
   op->range = range;
@@ -1708,6 +1867,7 @@ admit(GTask *task, StkYahoo *self, char *url, GError *url_error)
  * @task: (transfer full): the operation's task, the caller's reference is consumed
  * @type: the operation type
  * @url: (transfer full): the admitted request URL
+ * @next_url: (transfer full) (nullable): the URL of a second request (see op_new())
  * @symbol: (not nullable): the symbol, copied
  * @kind: the requested kind
  * @range: the requested range
@@ -1723,16 +1883,17 @@ admit(GTask *task, StkYahoo *self, char *url, GError *url_error)
  *    is queued or completed with the cancellation error; the caller's reference to @task is
  *    dropped.
  * Thread affinity: main thread only (the thread running the GLib main context)
- * Ownership: takes ownership of @url and of the caller's reference to @task; @symbol stays with the
- *   caller.
+ * Ownership: takes ownership of @url, @next_url and of the caller's reference to @task; @symbol
+ *   stays with the caller.
  */
 static void
-op_start(GTask *task, OpType type, char *url, const char *symbol, StkKind kind, StkRange range)
+op_start(GTask *task, OpType type, char *url, char *next_url, const char *symbol, StkKind kind,
+         StkRange range)
 {
   StkYahoo *self = STK_YAHOO(g_task_get_source_object(task));
-  g_task_set_task_data(task,
-                       op_new(self, type, url, symbol, kind, range, g_task_get_cancellable(task)),
-                       op_free);
+  g_task_set_task_data(
+      task, op_new(self, type, url, next_url, symbol, kind, range, g_task_get_cancellable(task)),
+      op_free);
   if (!g_task_return_error_if_cancelled(task))
     enqueue(task, FALSE);
   g_object_unref(task);
@@ -1748,7 +1909,7 @@ op_start(GTask *task, OpType type, char *url, const char *symbol, StkKind kind, 
  * @user_data: passed to @callback
  *
  * StkProviderInterface.fetch_quote_async: starts a quote request (see
- * stk_provider_fetch_quote_async()). A quote is derived from the range=1d chart response only.
+ * stk_provider_fetch_quote_async()). A quote is derived from the quote URL's response only.
  *
  * Preconditions:
  *  - @provider is a StkYahoo (it is reached only through that class's StkProvider vtable);
@@ -1770,10 +1931,9 @@ yahoo_fetch_quote_async(StkProvider *provider, const char *symbol, StkKind kind,
   GTask *task = g_task_new(self, cancellable, callback, user_data);
   g_task_set_source_tag(task, &tag_quote);
   GError *error = NULL;
-  /* A quote is derived from the range=1d chart response only. */
-  char *url = stk_yahoo_chart_url(self->base_url, symbol, kind, STK_RANGE_1D, &error);
+  char *url = stk_yahoo_quote_url(self->base_url, symbol, kind, &error);
   if (admit(task, self, url, error))
-    op_start(task, OP_QUOTE, url, symbol, kind, STK_RANGE_1D);
+    op_start(task, OP_QUOTE, url, NULL, symbol, kind, STK_RANGE_1D);
   else
     g_object_unref(task);
 }
@@ -1815,7 +1975,8 @@ yahoo_fetch_quote_finish(StkProvider *provider, GAsyncResult *result, GError **e
  * @user_data: passed to @callback
  *
  * StkProviderInterface.fetch_series_async: starts a series request (see
- * stk_provider_fetch_series_async()).
+ * stk_provider_fetch_series_async()). A 1D series is the chart request followed by the quote
+ * request, whose daily closes give the chart's previous close (see op_complete()).
  *
  * Preconditions:
  *  - @provider is a StkYahoo (it is reached only through that class's StkProvider vtable);
@@ -1839,8 +2000,12 @@ yahoo_fetch_series_async(StkProvider *provider, const char *symbol, StkKind kind
   g_task_set_source_tag(task, &tag_series);
   GError *error = NULL;
   char *url = stk_yahoo_chart_url(self->base_url, symbol, kind, range, &error);
-  if (admit(task, self, url, error))
-    op_start(task, OP_SERIES, url, symbol, kind, range);
+  if (admit(task, self, url, error)) {
+    /* The symbol and kind were just accepted, so the quote URL cannot fail. */
+    char *next_url = range == STK_RANGE_1D ? stk_yahoo_quote_url(self->base_url, symbol, kind, NULL)
+                                           : NULL;
+    op_start(task, OP_SERIES, url, next_url, symbol, kind, range);
+  }
   else
     g_object_unref(task);
 }

@@ -38,6 +38,11 @@
   <url type="bugtracker">https://github.com/wtp128pro/stocks/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.1" date="2026-10-13">
+      <description>
+        <p>Fixes the change shown for market indices: it is now measured against the previous session's close taken from Yahoo's daily bars. Yahoo's own previous-close field was stale, so the S&amp;P 500 and the Dow could show the change against an older session.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-10">
       <description>
         <p>Each stock remembers its chart range, also after a restart. Clicking the change label of a list row switches it between percent and points; the choice is remembered too.</p>

@@ -54,7 +54,13 @@ apart, and the app fetches the indices one at a time, using at most one of its
 4 request slots (see "Refresh policy"). While an index request is
 outstanding it takes 1 of the 4 slots, so the Nasdaq-backed symbols share the
 other 3: they may start later, but are never starved. A full refresh of the
-indices takes at least about 3 s per index job. Yahoo may throttle (HTTP 429,
+indices takes at least about 3 s per index job. An index's change is measured
+against the previous session's close read from Yahoo's daily bars (the quote
+request is `?range=5d&interval=1d`), never from the response's `previousClose`
+field, which Yahoo has served stale (on 2026-10-13 it gave the S&P 500 and Dow
+the close of Friday 2026-10-09, skipping Monday's session). The 1D chart of an
+index therefore takes two requests (the intraday chart, then the daily bars
+for its dashed previous-close line), about 3 s more. Yahoo may throttle (HTTP 429,
 not retried) or break this endpoint at any time, or be slow or unreachable;
 then only the index rows go stale (cached data is kept) while the
 Nasdaq-backed symbols keep refreshing, with 3 slots while an index request is
@@ -99,20 +105,20 @@ Fedora 44 (`x86_64` and source) only, because the packages are built there.
 
 ### From a downloaded RPM (Fedora)
 
-Download `stocks-0.2.0-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
+Download `stocks-0.2.1-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
 [GitHub releases](https://github.com/wtp128pro/stocks/releases) page, check the
 signature and install:
 
 ```sh
 gpg --show-keys RPM-GPG-KEY-stocks            # compare the fingerprint above
 sudo rpm --import RPM-GPG-KEY-stocks
-rpm -K stocks-0.2.0-1.*.rpm                   # must say "digests signatures OK"
-sudo dnf install ./stocks-0.2.0-1.*.rpm
+rpm -K stocks-0.2.1-1.*.rpm                   # must say "digests signatures OK"
+sudo dnf install ./stocks-0.2.1-1.*.rpm
 ```
 
 `rpm -K` also exits 0 for an unsigned package, which it reports as just
 `digests OK`; look for `signatures OK`. The release also has `SHA256SUMS` and
-detached signatures (`SHA256SUMS.asc`, `stocks-0.2.0.tar.gz.asc`):
+detached signatures (`SHA256SUMS.asc`, `stocks-0.2.1.tar.gz.asc`):
 
 ```sh
 gpg --import RPM-GPG-KEY-stocks
@@ -122,7 +128,7 @@ gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
 It installs the `stocks` command, a desktop entry (Office / Finance), an
 AppStream metainfo file and a full-colour and a symbolic icon, and needs no
 runtime dependency beyond the libraries `dnf` resolves from the binary and
-`hicolor-icon-theme`. The source RPM (`stocks-0.2.0-1.*.src.rpm`) is on the
+`hicolor-icon-theme`. The source RPM (`stocks-0.2.1-1.*.src.rpm`) is on the
 same page; see "Packaging notes" below to build it yourself.
 
 ### Build from source
@@ -729,8 +735,9 @@ project and are covered by the same licence as the program.
   change, throttle you or stop working at any time, and their terms of use
   are yours to check.
 - `src/provider/fixtures/` (Nasdaq API) and `src/indices/fixtures/` (Yahoo
-  chart endpoint: `chart_1d_index.json`, `chart_1y_index.json` and
-  `chart_error.json`) hold captured responses (the Yahoo ones trimmed) that
+  chart endpoint: `chart_1d_index.json`, `chart_5d_index.json`,
+  `chart_1y_index.json` and `chart_error.json`) hold captured responses (the
+  Yahoo ones trimmed, except `chart_5d_index.json`, which is complete) that
   the unit tests (`test-nasdaq.c`, `test-indices.c`) read as offline inputs. Nothing reads
   them at run time and `meson install` does not install them: they ship in the
   source tarball and the source RPM, not in the binary RPM.
@@ -746,11 +753,11 @@ project and are covered by the same licence as the program.
 The package is meant to be picked up by Fedora, and the repository carries
 what a reviewer needs:
 
-- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.0,
+- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.1,
   `License: GPL-3.0-or-later AND CC0-1.0`, `URL` https://github.com/wtp128pro/stocks).
 - Source: `Source0` is `%{url}/archive/v%{version}/%{name}-%{version}.tar.gz`,
-  i.e. GitHub's archive of the tag `v0.2.0`, named `stocks-0.2.0.tar.gz`, whose
-  top-level directory is `stocks-0.2.0/` (the spec uses `%autosetup`).
+  i.e. GitHub's archive of the tag `v0.2.1`, named `stocks-0.2.1.tar.gz`, whose
+  top-level directory is `stocks-0.2.1/` (the spec uses `%autosetup`).
 - Build with Meson (`%meson`, `%meson_build`, `%meson_install`); no
   patches, no bundled libraries, no Internet access at build or test time.
   `BuildRequires` (all resolve with `rpm -q --whatprovides`): `gcc`, `meson`,
@@ -771,7 +778,7 @@ user, mount and network namespace (explained below):
 ```sh
 top=/var/tmp/stocks-rpmbuild
 mkdir -p "$top/SOURCES"
-git archive --prefix=stocks-0.2.0/ -o "$top/SOURCES/stocks-0.2.0.tar.gz" HEAD
+git archive --prefix=stocks-0.2.1/ -o "$top/SOURCES/stocks-0.2.1.tar.gz" HEAD
 unshare -rmn sh -c 'ip link set lo up && mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $1" packaging/rpm/stocks.spec' sh "$top"
 rpmlint packaging/rpm/stocks.spec "$top"/RPMS/*/stocks-*.rpm "$top"/SRPMS/stocks-*.src.rpm
 ```

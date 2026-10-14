@@ -46,8 +46,10 @@
  *    is half-open [open, close) because the provider labels each minute
  *    sample by its START time (the sample labelled with the closing time is
  *    the first after-hours minute and is not returned). prev_close is the
- *    previous session's close, derived from the same provider's quote as
- *    quote price - quote change (see stk-nasdaq.h for why); NAN when that is
+ *    previous session's close, taken from the same provider's quote request
+ *    (StkNasdaq: quote price - quote change, see stk-nasdaq.h for why;
+ *    StkYahoo: the daily close before the chart's trading day, see
+ *    stk-yahoo.h), never from the chart response itself; NAN when that is
  *    unavailable. A failing quote lookup never fails the series.
  *  - StkSeries for STK_RANGE_1M/3M/6M/1Y: one point per trading day, valid
  *    for every kind; t_ms is 00:00 UTC of the trading day's calendar date

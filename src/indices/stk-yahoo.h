@@ -17,14 +17,23 @@
  *
  * (SYM upper-cased and percent-encoded, "^GSPC" -> "%5EGSPC"):
  *
+ *   quote         range=5d   interval=1d
  *   STK_RANGE_1D  range=1d   interval=5m
  *   STK_RANGE_1M  range=1mo  interval=1d
  *   STK_RANGE_3M  range=3mo  interval=1d
  *   STK_RANGE_6M  range=6mo  interval=1d
  *   STK_RANGE_1Y  range=1y   interval=1d
  *
- * A quote is served from the STK_RANGE_1D URL. No other Yahoo endpoint
- * (search, quote, crumb, ...) and no other host is used.
+ * A quote is served from the quote URL: the price from its meta, the
+ * previous close from its daily samples (meta.previousClose has been served
+ * stale; see stk_yahoo_parse_quote()). Every operation is one request,
+ * except a STK_RANGE_1D series, which is two made one after the other: the
+ * chart, then the quote URL for the previous close of the chart's trading
+ * day (stk_yahoo_parse_prev_close()). If that second request fails (any
+ * error after its retries, other than a cancellation), the series still
+ * succeeds with prev_close NAN; if the chart fails, the second request is
+ * never made. No other Yahoo endpoint (search, quote, crumb, ...) and no
+ * other host is used.
  *
  * Kinds: only STK_KIND_INDEX is accepted. Any other kind, an invalid symbol
  * (stk_symbol_is_valid()) or an invalid range is reported through the
@@ -38,11 +47,12 @@
  *    (the instant it was handed to the HTTP session). This holds for retries
  *    too: a retry is an attempt like any other and waits for its slot.
  *  - Retries: only after STK_ERROR_NETWORK, STK_ERROR_TIMEOUT and HTTP 5xx
- *    (STK_ERROR_HTTP), at most STK_YAHOO_MAX_RETRIES times per operation. The
- *    spacing above is the only delay between attempts. HTTP 429 and every
- *    other 4xx, parse errors and everything else are final: a 429 is
- *    reported (STK_ERROR_RATE_LIMITED) and the request is not repeated. A
- *    retry re-enters the queue at its head.
+ *    (STK_ERROR_HTTP), at most STK_YAHOO_MAX_RETRIES times per request (each
+ *    of the two requests of a 1D series has its own). The spacing above is
+ *    the only delay between attempts. HTTP 429 and every other 4xx, parse
+ *    errors and everything else are final: a 429 is reported
+ *    (STK_ERROR_RATE_LIMITED) and the request is not repeated. A retry, and
+ *    the second request of a 1D series, re-enter the queue at its head.
  *  - An operation counts toward STK_YAHOO_MAX_INFLIGHT from the moment it
  *    is accepted (queued, on the wire or waiting for a retry) until its
  *    callback has returned. An operation that would exceed the cap fails
@@ -74,10 +84,10 @@
  * an EMPTY array for every text (the text is not inspected) and never
  * touches the network; the indices are found through the catalog.
  *
- * All functions except the pure request builder and response parsers (stk_yahoo_chart_url(),
- * stk_yahoo_parse_quote(), stk_yahoo_parse_series()), which may be called from any thread, must be
- * used from the thread that runs the GLib main context (normally the main thread); StkYahoo is
- * not thread-safe. Operations keep the provider alive until they complete.
+ * All functions except the pure request builders and response parsers (stk_yahoo_chart_url(),
+ * stk_yahoo_quote_url(), stk_yahoo_parse_quote(), stk_yahoo_parse_series(),
+ * stk_yahoo_parse_prev_close()), which may be called from any thread, must be used from the thread
+ * that runs the GLib main context (normally the main thread); StkYahoo is not thread-safe. Operations keep the provider alive until they complete.
  */
 #ifndef STK_YAHOO_H
 #define STK_YAHOO_H
@@ -194,32 +204,57 @@ StkYahoo *stk_yahoo_new_custom(const char *base_url, guint timeout_ms, guint min
  * Ownership: @base_url and @symbol stay with the caller; the caller owns the
  *   returned string.
  *
- * Returns: (transfer full): the chart URL (also the quote URL when @range is
- *   STK_RANGE_1D); NULL with STK_ERROR_INVALID_ARG if @symbol, @kind or
- *   @range is invalid.
+ * Returns: (transfer full): the chart URL; NULL with STK_ERROR_INVALID_ARG if
+ *   @symbol, @kind or @range is invalid.
  */
 char *stk_yahoo_chart_url(const char *base_url, const char *symbol, StkKind kind, StkRange range,
                           GError **error);
 
 /**
+ * stk_yahoo_quote_url:
+ * @base_url: origin as accepted by stk_yahoo_new_custom(), no trailing "/".
+ * @symbol: (nullable): must satisfy stk_symbol_is_valid(); upper-cased and
+ *   percent-encoded into the URL path.
+ * @kind: must be STK_KIND_INDEX.
+ * @error: (nullable): receives STK_ERROR_INVALID_ARG.
+ *
+ * Builds the quote URL (range=5d, interval=1d): the request of a quote and the
+ * second request of a STK_RANGE_1D series.
+ *
+ * Preconditions / postconditions: those of stk_yahoo_chart_url() without the
+ *   range (the symbol is checked first, then the kind).
+ * Thread affinity: any thread (pure).
+ * Ownership: @base_url and @symbol stay with the caller; the caller owns the
+ *   returned string.
+ *
+ * Returns: (transfer full): the quote URL; NULL with STK_ERROR_INVALID_ARG if
+ *   @symbol or @kind is invalid.
+ */
+char *stk_yahoo_quote_url(const char *base_url, const char *symbol, StkKind kind, GError **error);
+
+/**
  * stk_yahoo_parse_quote:
- * @data: (nullable): body of a range=1d chart response (@len bytes, need not be
- *   NUL-terminated). The caller MUST pass a range=1d response: the previous
- *   close of other ranges is the close before the range start and would give
- *   a wrong change.
+ * @data: (nullable): body of a quote URL response (@len bytes, need not be
+ *   NUL-terminated). The caller MUST pass a response with daily samples
+ *   covering the session before the quoted one (the quote URL's five sessions
+ *   do).
  * @len: body length; at most STK_YAHOO_MAX_BODY_BYTES.
  * @symbol: the requested symbol, satisfying stk_symbol_is_valid().
  * @kind: the requested kind, STK_KIND_INDEX.
  * @error: (nullable): see the error mapping in the file comment.
  *
- * Maps chart.result[0].meta to a StkQuote. The result's symbol and kind are
- * the arguments, never response content. price = regularMarketPrice (a finite
- * number > 0, else STK_ERROR_PARSE). With previous close p = previousClose if
- * that is a finite number > 0, else chartPreviousClose likewise: change =
- * price - p and change_pct = change / p * 100; without a usable p (or if
- * either result is not finite) both are NAN. as_of_ms = regularMarketTime *
- * 1000 (0 if absent or outside
- * 2022-01-01..2100-12-31). is_realtime is FALSE (delayed data) and
+ * Maps chart.result[0] to a StkQuote. The result's symbol and kind are
+ * the arguments, never response content. price = meta.regularMarketPrice (a
+ * finite number > 0, else STK_ERROR_PARSE). as_of_ms = meta.regularMarketTime *
+ * 1000 (0 if absent or outside 2022-01-01..2100-12-31). The previous close p
+ * is the close before the session of as_of_ms's America/New_York date, read
+ * from the daily samples as stk_yahoo_parse_prev_close() does: change =
+ * price - p and change_pct = change / p * 100; without a usable p (also when
+ * as_of_ms is 0) or if either result is not finite, both are NAN.
+ * meta.previousClose and meta.chartPreviousClose are never used: the former
+ * has been served stale (2026-10-13, ^GSPC and ^DJI: the close of 2026-10-09,
+ * skipping the full session of 2026-10-12), the latter is the close before
+ * the range start. is_realtime is FALSE (delayed data) and
  * market_open is FALSE (the chart endpoint does not report the market
  * state). currency = meta.currency if it is three upper-case ASCII letters,
  * else "USD". name = meta.longName if usable (non-empty, at most 256 bytes, valid UTF-8, no
@@ -260,18 +295,19 @@ StkQuote *stk_yahoo_parse_quote(const guint8 *data, gsize len, const char *symbo
  * missing, null, non-numeric or non-finite, or if it would break the
  * ascending order. A response without timestamps is an empty series (valid).
  *
+ * prev_close is NAN for every range: the response holds no trustworthy
+ * previous close (see stk_yahoo_parse_quote()). fetch_series_async() fills
+ * the prev_close of a STK_RANGE_1D series from a second request.
+ *
  * STK_RANGE_1D: only samples with regular.start <= t < regular.end are kept,
  * where meta.currentTradingPeriod.regular.{start,end} (epoch seconds within
  * the same window, start < end; required, else STK_ERROR_PARSE) is the
  * trading day the response describes; t_ms is the true UTC instant
- * (seconds * 1000). prev_close = meta.previousClose if a finite number > 0,
- * else meta.chartPreviousClose likewise, else NAN. (Valid for a range=1d
- * response only.)
+ * (seconds * 1000). (Valid for a range=1d response only.)
  *
  * Daily ranges: t_ms is 00:00 UTC of the America/New_York calendar date of
  * the sample's timestamp; there is at most one point per date (the latest
- * sample with a close wins); prev_close is NAN (chartPreviousClose of these
- * responses is the close before the range start and is never used).
+ * sample with a close wins).
  *
  * Preconditions:
  *  - @data is NULL (reported as STK_ERROR_PARSE) or points to @len readable
@@ -294,6 +330,42 @@ StkQuote *stk_yahoo_parse_quote(const guint8 *data, gsize len, const char *symbo
  *   NULL with @error set.
  */
 StkSeries *stk_yahoo_parse_series(const guint8 *data, gsize len, StkRange range, GError **error);
+
+/**
+ * stk_yahoo_parse_prev_close:
+ * @data: (nullable): body of a quote URL response (daily samples).
+ * @len: body length; at most STK_YAHOO_MAX_BODY_BYTES.
+ * @day_ms: an instant (epoch ms) on the trading day whose previous close is
+ *   wanted, e.g. the start of a 1D chart's regular session.
+ * @error: (nullable): see the error mapping in the file comment.
+ *
+ * Reads the close of the session before the America/New_York date of
+ * @day_ms from chart.result[0] (timestamp[], indicators.quote[0].close[]):
+ * of the samples dated (New York date of the timestamp) before that date,
+ * only those of the LATEST such date count, and the close of the latest of
+ * them that is a finite number > 0 is returned. If that date has no usable
+ * close the result is NAN; the close of an earlier date, which would belong
+ * to an older session, is never used. Samples whose timestamp is missing,
+ * non-numeric or outside 2022-01-01..2100-12-31 are ignored.
+ *
+ * Preconditions:
+ *  - @data is NULL (reported as STK_ERROR_PARSE) or points to @len readable
+ *    bytes; a @len above STK_YAHOO_MAX_BODY_BYTES is rejected with
+ *    STK_ERROR_PARSE before any byte is read.
+ *  - @error is NULL or points to a NULL GError* (else critical, NAN).
+ * Postconditions:
+ *  - nothing is modified. A body that does not load (STK_ERROR_PARSE, or
+ *    STK_ERROR_NOT_FOUND for chart.error) returns NAN with *@error set (when
+ *    non-NULL); a well-formed body without a usable previous close (also when
+ *    @day_ms is outside the supported years) returns NAN with *@error
+ *    untouched.
+ * Thread affinity: any thread (pure; the only shared state is a read-only,
+ *   once-initialised time zone).
+ * Ownership: @data stays with the caller and is not retained.
+ *
+ * Returns: the previous close (finite, > 0), or NAN.
+ */
+double stk_yahoo_parse_prev_close(const guint8 *data, gsize len, gint64 day_ms, GError **error);
 
 G_END_DECLS
 

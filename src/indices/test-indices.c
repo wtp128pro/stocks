@@ -84,6 +84,12 @@ test_url_builder(void)
   g_autofree char *dot = stk_yahoo_chart_url("http://127.0.0.1:9", "BRK.B", STK_KIND_INDEX,
                                              STK_RANGE_1D, &error);
   g_assert_cmpstr(dot, ==, "http://127.0.0.1:9/v8/finance/chart/BRK.B?range=1d&interval=5m");
+  /* The quote URL: daily samples of the last five sessions. */
+  g_autofree char *quote = stk_yahoo_quote_url("https://query1.finance.yahoo.com", "^gspc",
+                                               STK_KIND_INDEX, &error);
+  g_assert_no_error(error);
+  g_assert_cmpstr(quote, ==,
+                  "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=5d&interval=1d");
 }
 
 static void
@@ -95,6 +101,9 @@ test_url_builder_rejections(void)
     g_assert_null(stk_yahoo_chart_url("http://127.0.0.1:9", "^GSPC", bad_kinds[i], STK_RANGE_1D,
                                       &error));
     g_assert_error(error, STK_ERROR, STK_ERROR_INVALID_ARG);
+    g_clear_error(&error);
+    g_assert_null(stk_yahoo_quote_url("http://127.0.0.1:9", "^GSPC", bad_kinds[i], &error));
+    g_assert_error(error, STK_ERROR, STK_ERROR_INVALID_ARG);
   }
   static const char *const bad_symbols[] = {"", " ^GSPC", "^GS PC", "../x", "A/B", "^GSPC?x=1",
                                             "A%2FB", "^GSPC#", "^GS\xc3\xa4", "^0123456789ABCDEF",
@@ -103,6 +112,9 @@ test_url_builder_rejections(void)
     g_autoptr(GError) error = NULL;
     g_assert_null(stk_yahoo_chart_url("http://127.0.0.1:9", bad_symbols[i], STK_KIND_INDEX,
                                       STK_RANGE_1D, &error));
+    g_assert_error(error, STK_ERROR, STK_ERROR_INVALID_ARG);
+    g_clear_error(&error);
+    g_assert_null(stk_yahoo_quote_url("http://127.0.0.1:9", bad_symbols[i], STK_KIND_INDEX, &error));
     g_assert_error(error, STK_ERROR, STK_ERROR_INVALID_ARG);
   }
   g_autoptr(GError) error = NULL;
@@ -129,7 +141,8 @@ test_series_1d_fixture(void)
   g_assert_nonnull(s);
   g_assert_cmpint(s->range, ==, STK_RANGE_1D);
   g_assert_cmpuint(s->n_points, ==, 7);
-  g_assert_cmpfloat_with_epsilon(s->prev_close, 7765.36, 1e-9);
+  /* meta.previousClose (7765.36 here) is not trusted: the request layer fills prev_close. */
+  g_assert_true(isnan(s->prev_close));
   /* True UTC instants, seconds * 1000, inside the regular session of 2026-10-09. */
   g_assert_cmpint(s->points[0].t_ms, ==, utc_ms(2026, 10, 9, 13, 30));
   g_assert_cmpint(s->points[6].t_ms, ==, G_GINT64_CONSTANT(1791554228000));
@@ -215,37 +228,28 @@ test_series_1d_filters(void)
   g_assert_cmpfloat(s->points[2].v, ==, 4.0);
   g_assert_cmpint(s->points[3].t_ms, ==, (E - 1) * 1000);
   g_assert_cmpfloat(s->points[3].v, ==, 6.0);
-  /* previousClose wins over chartPreviousClose. */
-  g_assert_cmpfloat(s->prev_close, ==, 100.5);
+  /* The meta's previousClose and chartPreviousClose are ignored. */
+  g_assert_true(isnan(s->prev_close));
 }
 
 static void
-test_series_1d_prev_close_sources(void)
+test_series_ignores_meta_prev_close(void)
 {
+  /* Neither meta.previousClose (Yahoo has served it stale) nor chartPreviousClose is ever a
+   * series' prev_close, whatever the range. */
   static const char *const periods =
       "\"currentTradingPeriod\":{\"regular\":{\"start\":1791552600,\"end\":1791576000}}";
-  static const struct {
-    const char *fields;
-    double expected; /* NAN: unknown */
-  } cases[] = {
-      {"\"previousClose\":100.5,\"chartPreviousClose\":90.25", 100.5},
-      {"\"previousClose\":null,\"chartPreviousClose\":90.25", 90.25},
-      {"\"chartPreviousClose\":90.25", 90.25},
-      {"\"previousClose\":0,\"chartPreviousClose\":90.25", 90.25},
-      {"\"previousClose\":-1,\"chartPreviousClose\":\"90\"", NAN},
-      {"\"previousClose\":\"100.5\"", NAN},
-      {"\"x\":1", NAN},
+  static const char *const fields[] = {
+      "\"previousClose\":100.5,\"chartPreviousClose\":90.25",
+      "\"chartPreviousClose\":90.25",
+      "\"x\":1",
   };
-  for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
-    g_autofree char *meta = g_strdup_printf("{%s,%s}", cases[i].fields, periods);
+  for (guint i = 0; i < G_N_ELEMENTS(fields); i++) {
+    g_autofree char *meta = g_strdup_printf("{%s,%s}", fields[i], periods);
     g_autofree char *body = chart_json(meta, "1791552600", "5");
     g_autoptr(StkSeries) s = parse_series_ok(body, STK_RANGE_1D);
     g_assert_cmpuint(s->n_points, ==, 1);
-    if (isnan(cases[i].expected))
-      g_assert_true(isnan(s->prev_close));
-    else
-      g_assert_cmpfloat(s->prev_close, ==, cases[i].expected);
-    /* Daily ranges never take a previous close. */
+    g_assert_true(isnan(s->prev_close));
     g_autoptr(StkSeries) d = parse_series_ok(body, STK_RANGE_1M);
     g_assert_true(isnan(d->prev_close));
   }
@@ -411,7 +415,7 @@ test_series_empty_and_shapes(void)
   g_autoptr(StkSeries) s1d = parse_series_ok(empty_1d, STK_RANGE_1D);
   g_assert_cmpuint(s1d->n_points, ==, 0);
   g_assert_cmpint(s1d->range, ==, STK_RANGE_1D);
-  g_assert_cmpfloat(s1d->prev_close, ==, 100.5);
+  g_assert_true(isnan(s1d->prev_close));
 
   /* Timestamps without a close array are malformed. */
   static const char *const broken[] = {
@@ -461,6 +465,10 @@ test_parse_errors(void)
     g_assert_null(stk_yahoo_parse_quote(BODY(kParseErrorBodies[i]), "^GSPC", STK_KIND_INDEX,
                                         &error));
     g_assert_error(error, STK_ERROR, STK_ERROR_PARSE);
+    g_clear_error(&error);
+    g_assert_true(isnan(stk_yahoo_parse_prev_close(BODY(kParseErrorBodies[i]),
+                                                   utc_ms(2026, 10, 13, 13, 30), &error)));
+    g_assert_error(error, STK_ERROR, STK_ERROR_PARSE);
   }
   g_autoptr(GError) error = NULL;
   /* NULL data with length 0, invalid UTF-8, a NUL byte in the middle. */
@@ -488,6 +496,9 @@ test_parse_errors(void)
   g_clear_error(&error);
   g_assert_null(stk_yahoo_parse_quote(blob, big, "^GSPC", STK_KIND_INDEX, &error));
   g_assert_error(error, STK_ERROR, STK_ERROR_PARSE);
+  g_clear_error(&error);
+  g_assert_true(isnan(stk_yahoo_parse_prev_close(blob, big, utc_ms(2026, 10, 13, 13, 30), &error)));
+  g_assert_error(error, STK_ERROR, STK_ERROR_PARSE);
   g_free(blob);
 }
 
@@ -502,6 +513,10 @@ test_chart_error_is_not_found(void)
   g_assert_nonnull(strstr(error->message, "No data found"));
   g_clear_error(&error);
   g_assert_null(stk_yahoo_parse_quote((const guint8 *)data, len, "^ZZZZ", STK_KIND_INDEX, &error));
+  g_assert_error(error, STK_ERROR, STK_ERROR_NOT_FOUND);
+  g_clear_error(&error);
+  g_assert_true(isnan(stk_yahoo_parse_prev_close((const guint8 *)data, len,
+                                                 utc_ms(2026, 10, 13, 13, 30), &error)));
   g_assert_error(error, STK_ERROR, STK_ERROR_NOT_FOUND);
   g_clear_error(&error);
 
@@ -551,7 +566,7 @@ static void
 test_quote_fixture(void)
 {
   gsize len;
-  g_autofree char *data = load_fixture("chart_1d_index.json", &len);
+  g_autofree char *data = load_fixture("chart_5d_index.json", &len);
   g_autoptr(GError) error = NULL;
   g_autoptr(StkQuote) q =
       stk_yahoo_parse_quote((const guint8 *)data, len, "^gspc", STK_KIND_INDEX, &error);
@@ -562,22 +577,99 @@ test_quote_fixture(void)
   g_assert_cmpint(q->kind, ==, STK_KIND_INDEX);
   g_assert_cmpstr(q->name, ==, "S&P 500");
   g_assert_cmpstr(q->currency, ==, "USD");
-  g_assert_cmpfloat_with_epsilon(q->price, 7785.61, 1e-9);
-  g_assert_cmpfloat_with_epsilon(q->change, 7785.61 - 7765.36, 1e-9);
-  g_assert_cmpfloat_with_epsilon(q->change_pct, (7785.61 - 7765.36) / 7765.36 * 100.0, 1e-9);
-  g_assert_cmpint(q->as_of_ms, ==, G_GINT64_CONSTANT(1791554228000));
+  g_assert_cmpfloat_with_epsilon(q->price, 7805.45, 1e-9);
+  /* Captured 2026-10-13 after the close. The change is against the close of 2026-10-12, the
+   * session before regularMarketTime's date (-1.79), not against the 7811.54 of 2026-10-09 that
+   * meta.previousClose of the range=1d response gave that evening (-6.09). */
+  const double prev = 7807.240234375;
+  g_assert_cmpfloat_with_epsilon(q->change, 7805.45 - prev, 1e-9);
+  g_assert_cmpfloat_with_epsilon(q->change_pct, (7805.45 - prev) / prev * 100.0, 1e-9);
+  g_assert_cmpint(q->as_of_ms, ==, G_GINT64_CONSTANT(1791923582000));
   g_assert_false(q->is_realtime);
   g_assert_false(q->market_open);
+
+  /* The range=1d chart has no daily sample before its session, and its meta.previousClose
+   * (7765.36) is not used: the change is unknown. */
+  g_autofree char *intraday = load_fixture("chart_1d_index.json", &len);
+  g_autoptr(StkQuote) i =
+      stk_yahoo_parse_quote((const guint8 *)intraday, len, "^GSPC", STK_KIND_INDEX, &error);
+  g_assert_no_error(error);
+  g_assert_cmpfloat_with_epsilon(i->price, 7785.61, 1e-9);
+  g_assert_true(isnan(i->change));
+  g_assert_true(isnan(i->change_pct));
+}
+
+/* 09:30 EDT of 2026-10-09, -12, -13 and -14, and 16:33:02 EDT of 2026-10-13 (epoch seconds, as
+ * JSON text). */
+#define DAY_1009 "1791552600"
+#define DAY_1012 "1791811800"
+#define DAY_1013 "1791898200"
+#define DAY_1014 "1791984600"
+#define AFTER_CLOSE_1013 "1791923582"
+
+/* Parses a quote of @price at @time (JSON text) with the daily samples @timestamps / @closes. */
+static StkQuote *
+parse_daily_quote(double price, const char *time, const char *timestamps, const char *closes)
+{
+  g_autofree char *meta =
+      g_strdup_printf("{\"regularMarketPrice\":%g,\"regularMarketTime\":%s}", price, time);
+  g_autofree char *body = chart_json(meta, timestamps, closes);
+  return parse_quote_ok(body, "^RUT");
+}
+
+static void
+test_prev_close(void)
+{
+  gsize len;
+  g_autofree char *data = load_fixture("chart_5d_index.json", &len);
+  /* Daily closes of the fixture (2026): 10-07 7801.77, 10-08 7765.36, 10-09 7811.54,
+   * 10-12 7807.24, 10-13 7805.45. */
+  static const struct {
+    int day, hour, minute; /* October 2026, UTC */
+    double expected;       /* NAN: none */
+  } cases[] = {
+      {13, 13, 30, 7807.240234375},  /* the session of 10-13: Monday's close */
+      {12, 13, 30, 7811.5400390625}, /* Monday 10-12: Friday's */
+      {14, 13, 30, 7805.4501953125}, /* the day after the last sample */
+      {13, 3, 0, 7811.5400390625},   /* 10-13 03:00 UTC is 10-12 23:00 in New York */
+      {10, 16, 0, 7811.5400390625},  /* Saturday: Friday's */
+      {8, 13, 30, 7801.77001953125},
+      {7, 13, 30, NAN}, /* nothing before the first sample */
+  };
+  for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+    g_autoptr(GError) error = NULL;
+    double p = stk_yahoo_parse_prev_close(
+        (const guint8 *)data, len, utc_ms(2026, 10, cases[i].day, cases[i].hour, cases[i].minute),
+        &error);
+    g_assert_no_error(error);
+    if (isnan(cases[i].expected))
+      g_assert_true(isnan(p));
+    else
+      g_assert_cmpfloat(p, ==, cases[i].expected);
+  }
+  /* No usable previous close is not an error: an instant outside the supported years, a chart
+   * without samples. */
+  g_autoptr(GError) error = NULL;
+  g_assert_true(isnan(stk_yahoo_parse_prev_close((const guint8 *)data, len, 0, &error)));
+  g_assert_no_error(error);
+  g_assert_true(isnan(stk_yahoo_parse_prev_close(BODY("{\"chart\":{\"result\":[{\"meta\":{}}]}}"),
+                                                 utc_ms(2026, 10, 13, 13, 30), &error)));
+  g_assert_no_error(error);
+  /* The error is optional. */
+  g_assert_true(isnan(stk_yahoo_parse_prev_close(BODY("{}"), utc_ms(2026, 10, 13, 13, 30), NULL)));
 }
 
 static void
 test_quote_fields(void)
 {
-  /* The requested symbol/kind win over the response's meta.symbol. */
+  /* The requested symbol/kind win over the response's meta.symbol. The meta's previous-close
+   * fields are ignored: the change is against the daily close before regularMarketTime's date. */
   g_autoptr(StkQuote) q = parse_quote_ok(
       "{\"chart\":{\"result\":[{\"meta\":{\"symbol\":\"^DJI\",\"currency\":\"EUR\","
-      "\"regularMarketPrice\":200,\"previousClose\":250,\"chartPreviousClose\":1,"
-      "\"regularMarketTime\":1791554228,\"longName\":\"Long\",\"shortName\":\"Short\"}}]}}",
+      "\"regularMarketPrice\":200,\"previousClose\":1,\"chartPreviousClose\":1,"
+      "\"regularMarketTime\":" AFTER_CLOSE_1013 ",\"longName\":\"Long\",\"shortName\":\"Short\"},"
+      "\"timestamp\":[" DAY_1009 "," DAY_1012 "," DAY_1013 "],"
+      "\"indicators\":{\"quote\":[{\"close\":[300,250,200]}]}}]}}",
       "^IXIC");
   g_assert_cmpstr(q->symbol, ==, "^IXIC");
   g_assert_cmpstr(q->name, ==, "Long");
@@ -585,31 +677,57 @@ test_quote_fields(void)
   g_assert_cmpfloat(q->price, ==, 200.0);
   g_assert_cmpfloat(q->change, ==, -50.0);
   g_assert_cmpfloat_with_epsilon(q->change_pct, -20.0, 1e-9);
+  g_assert_cmpint(q->as_of_ms, ==, G_GINT64_CONSTANT(1791923582000));
 
-  /* chartPreviousClose when previousClose is missing. */
+  /* Pre-market the next day the price is still 10-13's close, so the change stays against 10-12,
+   * although a (still empty) sample of 10-14 exists. */
+  g_autoptr(StkQuote) pre =
+      parse_daily_quote(110, AFTER_CLOSE_1013, DAY_1012 "," DAY_1013 "," DAY_1014, "100,110,null");
+  g_assert_cmpfloat(pre->change, ==, 10.0);
+  g_assert_cmpfloat_with_epsilon(pre->change_pct, 10.0, 1e-9);
+
+  /* Of several samples of the previous date the latest wins; one whose timestamp goes back does
+   * not. 1791820800 is 10-12 12:00 EDT, 1791835200 10-12 16:00 EDT. */
+  g_autoptr(StkQuote) late = parse_daily_quote(
+      110, AFTER_CLOSE_1013, DAY_1012 ",1791835200,1791820800," DAY_1013, "100,104,999,110");
+  g_assert_cmpfloat(late->change, ==, 6.0);
+
+  /* timestamp[] and close[] pair up to the shorter length. */
+  g_autoptr(StkQuote) shorter =
+      parse_daily_quote(110, AFTER_CLOSE_1013, DAY_1012 "," DAY_1013, "100");
+  g_assert_cmpfloat(shorter->change, ==, 10.0);
+
+  /* No usable previous close: the price stays, change and change_pct are unknown. The previous
+   * date without a close never falls back to an older session; nothing before the session; no
+   * samples at all; no regularMarketTime, or one outside the supported years. */
+  static const struct {
+    const char *time, *timestamps, *closes;
+  } unknown[] = {
+      {AFTER_CLOSE_1013, DAY_1009 "," DAY_1012 "," DAY_1013, "90,null,110"},
+      {AFTER_CLOSE_1013, DAY_1009 "," DAY_1012 "," DAY_1013, "90,0,110"},
+      {AFTER_CLOSE_1013, DAY_1013, "110"},
+      {AFTER_CLOSE_1013, "", ""},
+      {"null", DAY_1012 "," DAY_1013, "100,110"},
+      {"1", DAY_1012 "," DAY_1013, "100,110"},
+  };
+  for (guint i = 0; i < G_N_ELEMENTS(unknown); i++) {
+    g_autoptr(StkQuote) n =
+        parse_daily_quote(110, unknown[i].time, unknown[i].timestamps, unknown[i].closes);
+    g_assert_cmpfloat(n->price, ==, 110.0);
+    g_assert_true(isnan(n->change));
+    g_assert_true(isnan(n->change_pct));
+  }
   g_autoptr(StkQuote) c = parse_quote_ok(
-      "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":110,\"previousClose\":null,"
+      "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":110,\"previousClose\":100,"
       "\"chartPreviousClose\":100}}]}}",
       "^RUT");
-  g_assert_cmpfloat(c->change, ==, 10.0);
-  g_assert_cmpfloat_with_epsilon(c->change_pct, 10.0, 1e-9);
+  g_assert_true(isnan(c->change));
   g_assert_cmpstr(c->name, ==, "");
   g_assert_cmpstr(c->currency, ==, "USD");
   g_assert_cmpint(c->as_of_ms, ==, 0);
 
-  /* No usable previous close: the price stays, change and change_pct are unknown. */
-  g_autoptr(StkQuote) n = parse_quote_ok(
-      "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":110,\"previousClose\":0,"
-      "\"chartPreviousClose\":\"100\"}}]}}",
-      "^RUT");
-  g_assert_cmpfloat(n->price, ==, 110.0);
-  g_assert_true(isnan(n->change));
-  g_assert_true(isnan(n->change_pct));
-
   /* A previous close so small that the percentage overflows: unknown, never infinite. */
-  g_autoptr(StkQuote) t = parse_quote_ok(
-      "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":110,\"previousClose\":1e-320}}]}}",
-      "^RUT");
+  g_autoptr(StkQuote) t = parse_daily_quote(110, AFTER_CLOSE_1013, DAY_1012 "," DAY_1013, "1e-320,110");
   g_assert_cmpfloat(t->price, ==, 110.0);
   g_assert_true(isnan(t->change));
   g_assert_true(isnan(t->change_pct));
@@ -1172,18 +1290,19 @@ released_within(gpointer obj, guint ms)
   return finalized;
 }
 
-static char *kQuoteBody; /* the 1d fixture, loaded by main() */
+static char *kQuoteBody;   /* the quote URL fixture, loaded by main() */
+static char *kChartBody1d; /* the 1D chart fixture */
 static char *kSeriesBody1y;
 
 static void
 test_net_request_shape_and_results(void)
 {
-  Step script[] = {{STEP_RESPOND, 200, kQuoteBody, 0}, {STEP_RESPOND, 200, kQuoteBody, 0},
-                   {STEP_RESPOND, 200, kSeriesBody1y, 0}};
+  Step script[] = {{STEP_RESPOND, 200, kQuoteBody, 0}, {STEP_RESPOND, 200, kChartBody1d, 0},
+                   {STEP_RESPOND, 200, kQuoteBody, 0}, {STEP_RESPOND, 200, kSeriesBody1y, 0}};
   Fake *fake = fake_new(script, G_N_ELEMENTS(script));
   StkYahoo *y = provider_for(fake, 2000, 20);
 
-  /* Quote: served from the range=1d chart. Symbol and kind are the requested ones. */
+  /* Quote: served from the quote URL. Symbol and kind are the requested ones. */
   Outcome o = {0};
   fetch_quote(STK_PROVIDER(y), &o, "^gspc", STK_KIND_INDEX, NULL);
   wait_for(&o);
@@ -1192,11 +1311,12 @@ test_net_request_shape_and_results(void)
   g_assert_true(o.source == G_OBJECT(y));
   g_assert_cmpstr(o.quote->symbol, ==, "^GSPC");
   g_assert_cmpint(o.quote->kind, ==, STK_KIND_INDEX);
-  g_assert_cmpfloat_with_epsilon(o.quote->price, 7785.61, 1e-9);
+  g_assert_cmpfloat_with_epsilon(o.quote->price, 7805.45, 1e-9);
+  g_assert_cmpfloat_with_epsilon(o.quote->change, 7805.45 - 7807.240234375, 1e-9);
   g_assert_false(o.quote->is_realtime);
   g_assert_cmpuint(fake->requests, ==, 1);
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 0), ==,
-                  "/v8/finance/chart/%5EGSPC?range=1d&interval=5m");
+                  "/v8/finance/chart/%5EGSPC?range=5d&interval=1d");
   /* Read-only, identified, JSON, no credentials, cookies or browser identity. */
   g_assert_true(g_str_has_prefix(fake->last_request, "GET /v8/finance/chart/%5EGSPC?"));
   g_assert_nonnull(g_strstr_len(fake->last_request, -1, "User-Agent: stocks-app/"));
@@ -1209,15 +1329,20 @@ test_net_request_shape_and_results(void)
   spin_ms(30);
   g_assert_cmpuint(o.calls, ==, 1);
 
-  /* 1D series: the same request, parsed as a series. */
+  /* 1D series: the chart, then the quote URL for the previous close of the chart's trading day
+   * (2026-10-09: the close of 2026-10-08 in the quote fixture). */
   Outcome s = {0};
   fetch_series(STK_PROVIDER(y), &s, "^DJI", STK_KIND_INDEX, STK_RANGE_1D, NULL);
   wait_for(&s);
   g_assert_no_error(s.error);
   g_assert_cmpuint(s.series->n_points, ==, 7);
   g_assert_cmpint(s.series->range, ==, STK_RANGE_1D);
+  g_assert_cmpfloat(s.series->prev_close, ==, 7765.35986328125);
+  g_assert_cmpuint(fake->requests, ==, 3);
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 1), ==,
                   "/v8/finance/chart/%5EDJI?range=1d&interval=5m");
+  g_assert_cmpstr(g_ptr_array_index(fake->paths, 2), ==,
+                  "/v8/finance/chart/%5EDJI?range=5d&interval=1d");
   outcome_clear(&s);
 
   /* 1Y series. */
@@ -1228,7 +1353,8 @@ test_net_request_shape_and_results(void)
   g_assert_cmpuint(d.series->n_points, ==, 252);
   g_assert_cmpint(d.series->range, ==, STK_RANGE_1Y);
   g_assert_true(isnan(d.series->prev_close));
-  g_assert_cmpstr(g_ptr_array_index(fake->paths, 2), ==,
+  g_assert_cmpuint(fake->requests, ==, 4); /* one request for every other range */
+  g_assert_cmpstr(g_ptr_array_index(fake->paths, 3), ==,
                   "/v8/finance/chart/%5EIXIC?range=1y&interval=1d");
   outcome_clear(&d);
   g_assert_true(released_within(y, 2000));
@@ -1276,7 +1402,7 @@ test_net_base_url_trailing_slash(void)
   wait_for(&o);
   g_assert_no_error(o.error);
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 0), ==,
-                  "/v8/finance/chart/%5EGSPC?range=1d&interval=5m");
+                  "/v8/finance/chart/%5EGSPC?range=5d&interval=1d");
   outcome_clear(&o);
   g_assert_true(released_within(y, 2000));
   fake_free(fake);
@@ -1495,7 +1621,7 @@ test_net_gzip_body(void)
   fetch_quote(STK_PROVIDER(y), &o, "^GSPC", STK_KIND_INDEX, NULL);
   wait_for(&o);
   g_assert_no_error(o.error);
-  g_assert_cmpfloat_with_epsilon(o.quote->price, 7785.61, 1e-9);
+  g_assert_cmpfloat_with_epsilon(o.quote->price, 7805.45, 1e-9);
   g_assert_cmpuint(fake->requests, ==, 1);
   outcome_clear(&o);
   g_assert_true(released_within(y, 2000));
@@ -1552,7 +1678,7 @@ test_net_pacing_between_requests(void)
   g_assert_cmpint((g_get_monotonic_time() - start) / 1000, >=, 3 * 300 - 60);
   assert_spaced(fake, 0, 3, 300, 100);
   for (guint i = 0; i < 4; i++) {
-    g_autofree char *expected = g_strdup_printf("/v8/finance/chart/%%5E%s?range=1d&interval=5m",
+    g_autofree char *expected = g_strdup_printf("/v8/finance/chart/%%5E%s?range=5d&interval=1d",
                                                 symbols[i] + 1);
     g_assert_cmpstr(g_ptr_array_index(fake->paths, i), ==, expected);
     outcome_clear(&o[i]);
@@ -1605,11 +1731,136 @@ test_net_retries_are_paced(void)
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 0), ==, g_ptr_array_index(fake->paths, 1));
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 1), ==, g_ptr_array_index(fake->paths, 2));
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 3), ==,
-                  "/v8/finance/chart/%5EDJI?range=1d&interval=5m");
+                  "/v8/finance/chart/%5EDJI?range=5d&interval=1d");
   assert_spaced(fake, 0, 3, 250, 100);
   g_assert_cmpstr(a.quote->symbol, ==, "^GSPC");
   g_assert_cmpstr(b.quote->symbol, ==, "^DJI");
   outcome_clear(&a);
+  outcome_clear(&b);
+  g_assert_true(released_within(y, 2000));
+  fake_free(fake);
+}
+
+static void
+test_net_1d_prev_close_request(void)
+{
+  const char *const error_body =
+      "{\"chart\":{\"result\":null,\"error\":{\"code\":\"Not Found\",\"description\":\"gone\"}}}";
+  /* The previous close is optional: a final failure of the second request (404, 429, a chart
+   * error, a body without daily samples, 5xx after its own retries) still delivers the chart,
+   * with prev_close NAN. */
+  const struct {
+    Step second;
+    guint requests;
+  } optional[] = {
+      {{STEP_RESPOND, 404, "", 0}, 2},
+      {{STEP_RESPOND, 429, "", 0}, 2},
+      {{STEP_RESPOND, 200, error_body, 0}, 2},
+      {{STEP_RESPOND, 200, "{\"chart\":{\"result\":[{\"meta\":{}}]}}", 0}, 2},
+      {{STEP_RESPOND, 503, "", 0}, 2 + STK_YAHOO_MAX_RETRIES},
+  };
+  for (guint i = 0; i < G_N_ELEMENTS(optional); i++) {
+    Step script[] = {{STEP_RESPOND, 200, kChartBody1d, 0}, optional[i].second};
+    Fake *fake = fake_new(script, G_N_ELEMENTS(script));
+    StkYahoo *y = provider_for(fake, 2000, 10);
+    Outcome o = {0};
+    fetch_series(STK_PROVIDER(y), &o, "^GSPC", STK_KIND_INDEX, STK_RANGE_1D, NULL);
+    wait_for(&o);
+    g_assert_no_error(o.error);
+    g_assert_cmpuint(o.series->n_points, ==, 7);
+    g_assert_true(isnan(o.series->prev_close));
+    spin_ms(60);
+    g_assert_cmpuint(o.calls, ==, 1);
+    g_assert_cmpuint(fake->requests, ==, optional[i].requests);
+    g_assert_cmpstr(g_ptr_array_index(fake->paths, 1), ==,
+                    "/v8/finance/chart/%5EGSPC?range=5d&interval=1d");
+    outcome_clear(&o);
+    g_assert_true(released_within(y, 2000));
+    fake_free(fake);
+  }
+
+  /* A failing chart fails the series; the second request is never made. */
+  Step failing[] = {{STEP_RESPOND, 404, error_body, 0}, {STEP_RESPOND, 200, kQuoteBody, 0}};
+  Fake *fake = fake_new(failing, G_N_ELEMENTS(failing));
+  StkYahoo *y = provider_for(fake, 2000, 10);
+  Outcome f = {0};
+  fetch_series(STK_PROVIDER(y), &f, "^GSPC", STK_KIND_INDEX, STK_RANGE_1D, NULL);
+  wait_for(&f);
+  g_assert_error(f.error, STK_ERROR, STK_ERROR_NOT_FOUND);
+  g_assert_null(f.series);
+  spin_ms(60);
+  g_assert_cmpuint(fake->requests, ==, 1);
+  outcome_clear(&f);
+  g_assert_true(released_within(y, 2000));
+  fake_free(fake);
+
+  /* Each request has retries of its own, and the second one is paced like any other. */
+  Step retried[] = {{STEP_RESPOND, 503, "", 0},          {STEP_CLOSE, 0, NULL, 0},
+                    {STEP_RESPOND, 200, kChartBody1d, 0}, {STEP_RESPOND, 502, "", 0},
+                    {STEP_RESPOND, 503, "", 0},           {STEP_RESPOND, 200, kQuoteBody, 0}};
+  fake = fake_new(retried, G_N_ELEMENTS(retried));
+  y = provider_for(fake, 2000, 150);
+  Outcome r = {0};
+  fetch_series(STK_PROVIDER(y), &r, "^GSPC", STK_KIND_INDEX, STK_RANGE_1D, NULL);
+  wait_for(&r);
+  g_assert_no_error(r.error);
+  g_assert_cmpuint(r.series->n_points, ==, 7);
+  g_assert_cmpfloat(r.series->prev_close, ==, 7765.35986328125);
+  g_assert_cmpuint(fake->requests, ==, 6);
+  for (guint i = 0; i < 6; i++)
+    g_assert_cmpstr(g_ptr_array_index(fake->paths, i), ==,
+                    i < 3 ? "/v8/finance/chart/%5EGSPC?range=1d&interval=5m"
+                          : "/v8/finance/chart/%5EGSPC?range=5d&interval=1d");
+  assert_spaced(fake, 0, 5, 150, 60);
+  outcome_clear(&r);
+  g_assert_true(released_within(y, 2000));
+  fake_free(fake);
+}
+
+static void
+test_net_1d_cancel_second_request(void)
+{
+  /* Cancelled while the second request waits for its slot (a 30 s gap): the series completes at
+   * once with G_IO_ERROR_CANCELLED and the second request is never sent. */
+  Step waiting[] = {{STEP_RESPOND, 200, kChartBody1d, 0}, {STEP_RESPOND, 200, kQuoteBody, 0}};
+  Fake *fake = fake_new(waiting, G_N_ELEMENTS(waiting));
+  StkYahoo *y = provider_for(fake, 2000, 30000);
+  g_autoptr(GCancellable) c1 = g_cancellable_new();
+  Outcome a = {0};
+  fetch_series(STK_PROVIDER(y), &a, "^GSPC", STK_KIND_INDEX, STK_RANGE_1D, c1);
+  spin_ms(200);
+  g_assert_cmpuint(fake->requests, ==, 1);
+  g_assert_cmpuint(a.calls, ==, 0);
+  g_cancellable_cancel(c1);
+  gint64 start = g_get_monotonic_time();
+  while (a.calls == 0)
+    g_main_context_iteration(NULL, TRUE);
+  g_assert_cmpint((g_get_monotonic_time() - start) / 1000, <, 1500);
+  g_assert_error(a.error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  g_assert_null(a.series);
+  spin_ms(60);
+  g_assert_cmpuint(fake->requests, ==, 1);
+  outcome_clear(&a);
+  g_assert_true(released_within(y, 2000));
+  fake_free(fake);
+
+  /* Cancelled while the second request is on the wire: cancelled, not retried, and the chart is
+   * not delivered on its own. */
+  Step hanging[] = {{STEP_RESPOND, 200, kChartBody1d, 0}, {STEP_HANG, 0, NULL, 0}};
+  fake = fake_new(hanging, G_N_ELEMENTS(hanging));
+  y = provider_for(fake, 20000, 10);
+  g_autoptr(GCancellable) c2 = g_cancellable_new();
+  Outcome b = {0};
+  fetch_series(STK_PROVIDER(y), &b, "^GSPC", STK_KIND_INDEX, STK_RANGE_1D, c2);
+  spin_ms(200);
+  g_assert_cmpuint(fake->requests, ==, 2);
+  g_assert_cmpuint(b.calls, ==, 0);
+  g_cancellable_cancel(c2);
+  wait_for(&b);
+  g_assert_error(b.error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  g_assert_null(b.series);
+  spin_ms(60);
+  g_assert_cmpuint(fake->requests, ==, 2);
   outcome_clear(&b);
   g_assert_true(released_within(y, 2000));
   fake_free(fake);
@@ -1734,7 +1985,7 @@ test_net_cancel_from_a_callback(void)
   spin_ms(50);
   g_assert_cmpuint(fake->requests, ==, 2);
   g_assert_cmpstr(g_ptr_array_index(fake->paths, 1), ==,
-                  "/v8/finance/chart/%5EIXIC?range=1d&interval=5m");
+                  "/v8/finance/chart/%5EIXIC?range=5d&interval=1d");
   outcome_clear(&a);
   outcome_clear(&b);
   outcome_clear(&c);
@@ -2353,10 +2604,11 @@ static const char *const kNasdaqSearchBody =
 static void
 test_router_with_real_providers(void)
 {
-  Step yahoo_script[] = {{STEP_RESPOND, 200, kQuoteBody, 0}};
+  Step yahoo_script[] = {{STEP_RESPOND, 200, kQuoteBody, 0}, {STEP_RESPOND, 200, kChartBody1d, 0},
+                         {STEP_RESPOND, 200, kQuoteBody, 0}};
   Step nasdaq_script[] = {{STEP_RESPOND, 200, kNasdaqQuoteBody, 0},
                           {STEP_RESPOND, 200, kNasdaqSearchBody, 0}};
-  Fake *yahoo_fake = fake_new(yahoo_script, 1);
+  Fake *yahoo_fake = fake_new(yahoo_script, G_N_ELEMENTS(yahoo_script));
   Fake *nasdaq_fake = fake_new(nasdaq_script, G_N_ELEMENTS(nasdaq_script));
   StkYahoo *yahoo = provider_for(yahoo_fake, 2000, 10);
   g_autofree char *base = g_strdup_printf("http://127.0.0.1:%u", nasdaq_fake->port);
@@ -2373,7 +2625,7 @@ test_router_with_real_providers(void)
   g_assert_no_error(o.error);
   g_assert_cmpstr(o.quote->symbol, ==, "^GSPC");
   g_assert_cmpint(o.quote->kind, ==, STK_KIND_INDEX);
-  g_assert_cmpfloat_with_epsilon(o.quote->price, 7785.61, 1e-9);
+  g_assert_cmpfloat_with_epsilon(o.quote->price, 7805.45, 1e-9);
   g_assert_cmpuint(yahoo_fake->requests, ==, 1);
   g_assert_cmpuint(nasdaq_fake->requests, ==, 0);
   outcome_clear(&o);
@@ -2383,7 +2635,8 @@ test_router_with_real_providers(void)
   wait_for(&s);
   g_assert_no_error(s.error);
   g_assert_cmpuint(s.series->n_points, ==, 7);
-  g_assert_cmpuint(yahoo_fake->requests, ==, 2);
+  g_assert_cmpfloat(s.series->prev_close, ==, 7765.35986328125);
+  g_assert_cmpuint(yahoo_fake->requests, ==, 3); /* the chart and the previous close */
   g_assert_cmpuint(nasdaq_fake->requests, ==, 0);
   outcome_clear(&s);
 
@@ -2394,7 +2647,7 @@ test_router_with_real_providers(void)
   g_assert_no_error(n.error);
   g_assert_cmpstr(n.quote->symbol, ==, "AAPL");
   g_assert_cmpstr(n.quote->name, ==, "Test Co");
-  g_assert_cmpuint(yahoo_fake->requests, ==, 2);
+  g_assert_cmpuint(yahoo_fake->requests, ==, 3);
   g_assert_cmpuint(nasdaq_fake->requests, ==, 1);
   g_assert_cmpstr(g_ptr_array_index(nasdaq_fake->paths, 0), ==,
                   "/api/quote/AAPL/info?assetclass=stocks");
@@ -2408,7 +2661,7 @@ test_router_with_real_providers(void)
   g_assert_no_error(h.error);
   g_assert_cmpuint(h.hits->len, ==, 1);
   g_assert_cmpstr(((StkSearchHit *)g_ptr_array_index(h.hits, 0))->symbol, ==, "AAPL");
-  g_assert_cmpuint(yahoo_fake->requests, ==, 2);
+  g_assert_cmpuint(yahoo_fake->requests, ==, 3);
   g_assert_cmpuint(nasdaq_fake->requests, ==, 2);
   g_assert_true(g_str_has_prefix(g_ptr_array_index(nasdaq_fake->paths, 1), "/api/autocomplete/"));
   outcome_clear(&h);
@@ -2435,7 +2688,7 @@ test_router_with_real_providers(void)
     outcome_clear(&r);
   }
   spin_ms(50);
-  g_assert_cmpuint(yahoo_fake->requests, ==, 2);
+  g_assert_cmpuint(yahoo_fake->requests, ==, 3);
   g_assert_cmpuint(nasdaq_fake->requests, ==, 2);
 
   /* Yahoo's search is empty and offline; the router never uses it anyway. */
@@ -2457,7 +2710,8 @@ main(int argc, char **argv)
   }
   fixture_dir = argv[1];
   gsize len;
-  kQuoteBody = load_fixture("chart_1d_index.json", &len);
+  kQuoteBody = load_fixture("chart_5d_index.json", &len);
+  kChartBody1d = load_fixture("chart_1d_index.json", &len);
   kSeriesBody1y = load_fixture("chart_1y_index.json", &len);
 
   g_test_add_func("/indices/url/builder", test_url_builder);
@@ -2465,7 +2719,7 @@ main(int argc, char **argv)
   g_test_add_func("/indices/series/1d-fixture", test_series_1d_fixture);
   g_test_add_func("/indices/series/daily-fixture", test_series_daily_fixture);
   g_test_add_func("/indices/series/1d-filters", test_series_1d_filters);
-  g_test_add_func("/indices/series/1d-prev-close", test_series_1d_prev_close_sources);
+  g_test_add_func("/indices/series/no-meta-prev-close", test_series_ignores_meta_prev_close);
   g_test_add_func("/indices/series/1d-needs-period", test_series_1d_requires_trading_period);
   g_test_add_func("/indices/series/daily-dates", test_series_daily_dates);
   g_test_add_func("/indices/series/daily-dst", test_series_daily_dst_boundary);
@@ -2478,6 +2732,7 @@ main(int argc, char **argv)
   g_test_add_func("/indices/parse/chart-error", test_chart_error_is_not_found);
   g_test_add_func("/indices/quote/fixture", test_quote_fixture);
   g_test_add_func("/indices/quote/fields", test_quote_fields);
+  g_test_add_func("/indices/quote/prev-close", test_prev_close);
   g_test_add_func("/indices/quote/text-and-time", test_quote_sanitizes_text_and_time);
   g_test_add_func("/indices/quote/errors", test_quote_errors);
   g_test_add_func("/indices/provider/constants-and-origins", test_constants_and_origin_policy);
@@ -2497,6 +2752,8 @@ main(int argc, char **argv)
   g_test_add_func("/indices/net/pacing", test_net_pacing_between_requests);
   g_test_add_func("/indices/net/one-on-the-wire", test_net_one_request_on_the_wire);
   g_test_add_func("/indices/net/retries-paced", test_net_retries_are_paced);
+  g_test_add_func("/indices/net/1d-prev-close", test_net_1d_prev_close_request);
+  g_test_add_func("/indices/net/1d-cancel-second", test_net_1d_cancel_second_request);
   g_test_add_func("/indices/net/deadline-at-send", test_net_deadline_starts_at_send);
   g_test_add_func("/indices/net/cancel-queued", test_net_cancel_queued_operation);
   g_test_add_func("/indices/net/cancel-all", test_net_cancel_all_at_once);
@@ -2517,6 +2774,7 @@ main(int argc, char **argv)
 
   int rc = g_test_run();
   g_free(kQuoteBody);
+  g_free(kChartBody1d);
   g_free(kSeriesBody1y);
   return rc;
 }
