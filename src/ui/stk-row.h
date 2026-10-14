@@ -23,8 +23,9 @@
  * StkRow
  * ------
  * The widget bound to an item by the list view's factory: symbol, name,
+ * a pill with the item's chart range (1D, 1M, ...; 1M for a fund set to 1D),
  * price, change (percent, or points after a click on it; the click does not
- * select the row), StkSparkline and a "..." menu button (Move up, Move down,
+ * select the row) and a "..." menu button (Move up, Move down,
  * Remove) with the CSS class "stk-row". The row is also a drag source and drop
  * target: dropping another row on it asks to move that row to this row's
  * position. The row never touches the watchlist: it only emits requests that
@@ -32,7 +33,7 @@
  * outside the application) and acts.
  *
  * CSS: the labels have the style classes "stk-symbol", "stk-name",
- * "stk-price" and "stk-change"; the last carries "positive", "negative" or
+ * "stk-range", "stk-price" and "stk-change"; the last carries "positive", "negative" or
  * "flat". The row has the class "stale" while the item is stale.
  */
 #ifndef STK_ROW_H

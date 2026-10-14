@@ -1,7 +1,7 @@
 %global app_id io.github.wtp128pro.Stocks
 
 Name:           stocks
-Version:        0.2.1
+Version:        0.2.2
 Release:        1%{?dist}
 Summary:        GTK4 desktop app to follow shares, ETFs, mutual funds and indices
 
@@ -71,6 +71,10 @@ GTK_IM_MODULE=simple GTK_A11Y=none xvfb-run -a %{shrink:%meson_test}
 %{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
 
 %changelog
+* Wed Oct 14 2026 wtp128pro - 0.2.2-1
+- Watchlist rows show the chart range chosen for each stock as a pill
+  label instead of the one-month sparkline
+
 * Tue Oct 13 2026 wtp128pro - 0.2.1-1
 - Market indices: measure the change against the previous session's close
   from Yahoo's daily bars; Yahoo's previousClose field was stale

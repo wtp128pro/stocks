@@ -3,7 +3,7 @@
 A small GTK4 desktop watchlist for stocks, ETFs, Fidelity mutual funds and
 the main US market indices,
 written in C with Meson. It shows a list of the instruments you follow (price,
-change, a one-month sparkline) and, for the selected one, a price chart for
+change, the chart range chosen for it) and, for the selected one, a price chart for
 1D / 1M / 3M / 6M / 1Y. It is built to idle cheaply: no periodic timer runs
 unless the US market is open, the window is visible and the network is up.
 
@@ -16,8 +16,8 @@ project.
 - Watchlist of stocks, ETFs, mutual funds and the market indices (S&P 500,
   Dow Jones, Nasdaq Composite, Russell 2000), with per-row menu (Move up,
   Move down, Remove) and drag-and-drop reordering. Stored locally.
-- Quote and 1M sparkline per row; chart of the selected row for 1D, 1M, 3M,
-  6M and 1Y.
+- Quote and chart-range pill per row; chart of the selected row for 1D, 1M,
+  3M, 6M and 1Y (remembered per row and shown in its pill).
 - "Add" window: browse the built-in Fidelity ETF / mutual-fund catalog and the
   four market indices (filter by text, kind - all, ETFs, mutual funds, indices -
   and category) or search symbols online.
@@ -105,20 +105,20 @@ Fedora 44 (`x86_64` and source) only, because the packages are built there.
 
 ### From a downloaded RPM (Fedora)
 
-Download `stocks-0.2.1-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
+Download `stocks-0.2.2-1.<dist>.<arch>.rpm` and `RPM-GPG-KEY-stocks` from the
 [GitHub releases](https://github.com/wtp128pro/stocks/releases) page, check the
 signature and install:
 
 ```sh
 gpg --show-keys RPM-GPG-KEY-stocks            # compare the fingerprint above
 sudo rpm --import RPM-GPG-KEY-stocks
-rpm -K stocks-0.2.1-1.*.rpm                   # must say "digests signatures OK"
-sudo dnf install ./stocks-0.2.1-1.*.rpm
+rpm -K stocks-0.2.2-1.*.rpm                   # must say "digests signatures OK"
+sudo dnf install ./stocks-0.2.2-1.*.rpm
 ```
 
 `rpm -K` also exits 0 for an unsigned package, which it reports as just
 `digests OK`; look for `signatures OK`. The release also has `SHA256SUMS` and
-detached signatures (`SHA256SUMS.asc`, `stocks-0.2.1.tar.gz.asc`):
+detached signatures (`SHA256SUMS.asc`, `stocks-0.2.2.tar.gz.asc`):
 
 ```sh
 gpg --import RPM-GPG-KEY-stocks
@@ -128,7 +128,7 @@ gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
 It installs the `stocks` command, a desktop entry (Office / Finance), an
 AppStream metainfo file and a full-colour and a symbolic icon, and needs no
 runtime dependency beyond the libraries `dnf` resolves from the binary and
-`hicolor-icon-theme`. The source RPM (`stocks-0.2.1-1.*.src.rpm`) is on the
+`hicolor-icon-theme`. The source RPM (`stocks-0.2.2-1.*.src.rpm`) is on the
 same page; see "Packaging notes" below to build it yourself.
 
 ### Build from source
@@ -363,7 +363,7 @@ The decisions live in `src/ui/stk-scheduler.h` (pure logic, unit-tested in
 
 - Requests are made only while the window is visible (mapped and not
   minimised) **and** the network is available.
-- One refresh of everything (quotes, 1M sparklines, the selected chart) on
+- One refresh of everything (quotes, the 1M series of every row, the selected chart) on
   start-up/becoming visible, when the window regains focus, and when the
   network comes back. A job that succeeded less than 5 s ago is skipped.
 - Every 60 s a periodic refresh of quotes (and the selected chart), **only
@@ -675,12 +675,6 @@ empty, negative) exits 2 immediately, before anything is started.
   app was not run for several days). Nasdaq returns only pre-market points
   before 09:30 ET and the provider keeps the regular session only, so the
   1D chart shows the last session until today's regular session has points.
-- **Sparkline colour.** The colour of a row's sparkline comes from its own
-  one-month series (positive when the last point is at or above the first,
-  negative otherwise), while the change figure in the row is coloured from the
-  quote's daily change. The two can therefore disagree: for example a stock
-  that is down on the day but up over the month shows a negative change next
-  to a positive sparkline.
 - Quotes depend on the unofficial API (see above); a failed refresh shows
   the previous data dimmed, not an error dialog. Fidelity funds'
   NAV arrives once a day.
@@ -753,11 +747,11 @@ project and are covered by the same licence as the program.
 The package is meant to be picked up by Fedora, and the repository carries
 what a reviewer needs:
 
-- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.1,
+- Spec file: `packaging/rpm/stocks.spec` (name `stocks`, version 0.2.2,
   `License: GPL-3.0-or-later AND CC0-1.0`, `URL` https://github.com/wtp128pro/stocks).
 - Source: `Source0` is `%{url}/archive/v%{version}/%{name}-%{version}.tar.gz`,
-  i.e. GitHub's archive of the tag `v0.2.1`, named `stocks-0.2.1.tar.gz`, whose
-  top-level directory is `stocks-0.2.1/` (the spec uses `%autosetup`).
+  i.e. GitHub's archive of the tag `v0.2.2`, named `stocks-0.2.2.tar.gz`, whose
+  top-level directory is `stocks-0.2.2/` (the spec uses `%autosetup`).
 - Build with Meson (`%meson`, `%meson_build`, `%meson_install`); no
   patches, no bundled libraries, no Internet access at build or test time.
   `BuildRequires` (all resolve with `rpm -q --whatprovides`): `gcc`, `meson`,
@@ -778,7 +772,7 @@ user, mount and network namespace (explained below):
 ```sh
 top=/var/tmp/stocks-rpmbuild
 mkdir -p "$top/SOURCES"
-git archive --prefix=stocks-0.2.1/ -o "$top/SOURCES/stocks-0.2.1.tar.gz" HEAD
+git archive --prefix=stocks-0.2.2/ -o "$top/SOURCES/stocks-0.2.2.tar.gz" HEAD
 unshare -rmn sh -c 'ip link set lo up && mount -t tmpfs tmpfs /tmp && exec rpmbuild -ba --define "_topdir $1" packaging/rpm/stocks.spec' sh "$top"
 rpmlint packaging/rpm/stocks.spec "$top"/RPMS/*/stocks-*.rpm "$top"/SRPMS/stocks-*.src.rpm
 ```

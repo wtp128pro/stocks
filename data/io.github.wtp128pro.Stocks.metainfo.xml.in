@@ -11,8 +11,8 @@
   <description>
     <p>
       Stocks is a small GTK4 desktop watchlist. It lists the instruments you
-      follow with price, change and a one-month sparkline, and shows a price
-      chart for the selected one (1D, 1M, 3M, 6M and 1Y). It includes a
+      follow with price, change and the chart range chosen for each, and shows
+      a price chart for the selected one (1D, 1M, 3M, 6M and 1Y). It includes a
       built-in catalog of Fidelity ETFs and mutual funds and the main US
       market indices, and keeps a local cache so it still shows data when
       offline.
@@ -38,6 +38,11 @@
   <url type="bugtracker">https://github.com/wtp128pro/stocks/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.2" date="2026-10-14">
+      <description>
+        <p>Each row of the watchlist now shows the chart range chosen for that instrument (1D, 1M, 3M, 6M or 1Y) as a pill label in place of the one-month sparkline.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-10-13">
       <description>
         <p>Fixes the change shown for market indices: it is now measured against the previous session's close taken from Yahoo's daily bars. Yahoo's own previous-close field was stale, so the S&amp;P 500 and the Dow could show the change against an older session.</p>

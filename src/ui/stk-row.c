@@ -6,8 +6,6 @@
 #include <math.h>
 #include <string.h>
 
-#include "stk-sparkline.h"
-
 /* ------------------------------------------------------------------------ */
 /* Formatting                                                               */
 /* ------------------------------------------------------------------------ */
@@ -499,14 +497,13 @@ struct _StkRow {
   GtkBox parent_instance;
   GtkWidget *symbol_label;
   GtkWidget *name_label;
-  GtkWidget *spark;
+  GtkWidget *range_label;
   GtkWidget *price_label;
   GtkWidget *change_label;
   GtkWidget *menu_button;
 
   StkRowItem *item; /* strong while bound */
   gulong changed_id;
-  StkSeries *shown_spark;  /* strong: what the sparkline currently draws */
   const char *shown_class; /* static string of the change label's colour class */
 };
 
@@ -550,31 +547,43 @@ set_change_class(StkRow *self, const char *cls)
     gtk_widget_add_css_class(self->change_label, cls);
 }
 
+/* Pill text and tooltip of each range, indexed by StkRange (same text as the detail pane's
+ * range buttons). */
+static const char *const range_labels[] = {"1D", "1M", "3M", "6M", "1Y"};
+static const char *const range_tooltips[] = {"Chart range: 1 day", "Chart range: 1 month",
+                                             "Chart range: 3 months", "Chart range: 6 months",
+                                             "Chart range: 12 months"};
+G_STATIC_ASSERT(G_N_ELEMENTS(range_labels) == STK_RANGE_1Y + 1);
+G_STATIC_ASSERT(G_N_ELEMENTS(range_tooltips) == STK_RANGE_1Y + 1);
+
 /**
- * set_spark:
+ * set_range:
  * @self: (not nullable): the row.
- * @series: (nullable): the series to draw, or NULL to clear the sparkline.
+ * @item: (nullable): the bound item, or NULL to clear the pill.
  *
- * Makes the sparkline draw @series and keeps one reference on it for the row.
+ * Shows the chart range the detail pane uses for @item in the range pill: the item's view range,
+ * except that a fund (no intraday data) shows 1M instead of 1D, as the detail pane does.
  *
  * Preconditions:
- *  - @self is a constructed StkRow; @series is NULL or a valid StkSeries.
+ *  - @self is a constructed StkRow; @item is NULL or a live StkRowItem.
  * Postconditions:
- *  - @self->shown_spark is @series (the row holds one reference of its own, the previous one is
- *    released) and the sparkline was given @series; nothing happens when it already was.
+ *  - the pill shows the range label and tooltip, or is hidden when @item is NULL.
  * Thread affinity: main thread only.
- * Ownership: @series stays with the caller; the row takes its own reference.
+ * Ownership: none transferred; the strings are static.
  */
 static void
-set_spark(StkRow *self, StkSeries *series)
+set_range(StkRow *self, StkRowItem *item)
 {
-  if (self->shown_spark == series)
+  if (item == NULL) {
+    gtk_widget_set_visible(self->range_label, FALSE);
     return;
-  StkSeries *ref = series != NULL ? stk_series_ref(series) : NULL;
-  if (self->shown_spark != NULL)
-    stk_series_unref(self->shown_spark);
-  self->shown_spark = ref;
-  stk_sparkline_set_series(STK_SPARKLINE(self->spark), series);
+  }
+  StkRange range = stk_row_item_get_view_range(item);
+  if (stk_row_item_get_kind(item) == STK_KIND_FUND && range == STK_RANGE_1D)
+    range = STK_RANGE_1M;
+  gtk_label_set_text(GTK_LABEL(self->range_label), range_labels[range]);
+  gtk_widget_set_tooltip_text(self->range_label, range_tooltips[range]);
+  gtk_widget_set_visible(self->range_label, TRUE);
 }
 
 /**
@@ -582,13 +591,13 @@ set_spark(StkRow *self, StkSeries *series)
  * @self: (not nullable): the row.
  *
  * Redraws the whole row from the bound item (blank when none): texts, change colour class,
- * sparkline and the "stale" class. Also the callback of the bound item's "changed" signal
+ * range pill and the "stale" class. Also the callback of the bound item's "changed" signal
  * (connected with g_signal_connect_swapped(), so the row is its first argument).
  *
  * Preconditions:
  *  - @self is a constructed StkRow; @self->item is NULL or a live StkRowItem (strongly held).
  * Postconditions:
- *  - the labels, classes and sparkline reflect the item's current data; a missing quote shows
+ *  - the labels, classes and range pill reflect the item's current data; a missing quote shows
  *    the em dash. The item is not modified.
  * Thread affinity: main thread only.
  * Ownership: none transferred; all strings are borrowed or freed locally.
@@ -602,7 +611,7 @@ refresh(StkRow *self)
     gtk_label_set_text(GTK_LABEL(self->price_label), "");
     gtk_label_set_text(GTK_LABEL(self->change_label), "");
     set_change_class(self, NULL);
-    set_spark(self, NULL);
+    set_range(self, NULL);
     gtk_widget_remove_css_class(GTK_WIDGET(self), "stale");
     return;
   }
@@ -619,7 +628,7 @@ refresh(StkRow *self)
   g_autofree char *change_text = points ? stk_format_change(change) : stk_format_percent(change);
   gtk_label_set_text(GTK_LABEL(self->change_label), change_text);
   set_change_class(self, stk_change_class(change));
-  set_spark(self, stk_row_item_get_spark(self->item));
+  set_range(self, self->item);
   if (stk_row_item_get_stale(self->item))
     gtk_widget_add_css_class(GTK_WIDGET(self), "stale");
   else
@@ -907,16 +916,16 @@ on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer
  * stk_row_dispose:
  * @object: the row being disposed.
  *
- * GObject dispose vfunc: disconnects from the bound item and drops the references on the item
- * and the shown series, then chains up. May run more than once.
+ * GObject dispose vfunc: disconnects from the bound item and drops the reference on it, then
+ * chains up. May run more than once.
  *
  * Preconditions:
  *  - @object is a StkRow; called by GObject (possibly repeatedly).
  * Postconditions:
- *  - the row is unbound (no handler of the item points at it any more), item and shown_spark are
- *    NULL; the parent dispose has run. A second call finds both NULL and only chains up.
+ *  - the row is unbound (no handler of the item points at it any more), item is NULL; the parent
+ *    dispose has run. A second call finds item NULL and only chains up.
  * Thread affinity: main thread only.
- * Ownership: the item reference and the series reference held by the row are released.
+ * Ownership: the item reference held by the row is released.
  */
 static void
 stk_row_dispose(GObject *object)
@@ -927,7 +936,6 @@ stk_row_dispose(GObject *object)
     self->changed_id = 0;
     g_clear_object(&self->item);
   }
-  g_clear_pointer(&self->shown_spark, stk_series_unref);
   G_OBJECT_CLASS(stk_row_parent_class)->dispose(object);
 }
 
@@ -1024,7 +1032,7 @@ on_change_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpo
  * stk_row_init:
  * @self: (not nullable): the new row (zero-filled by GObject).
  *
- * GObject instance initialiser: builds the child widgets (symbol/name, sparkline, price, change,
+ * GObject instance initialiser: builds the child widgets (symbol/name, range pill, price, change,
  * menu button), the "row" action group (remove, move-up, move-down) and the drag source and drop
  * target. The action and controller handlers are connected with g_signal_connect_object() and
  * the row as the object, so they never outlive it. The row starts unbound.
@@ -1058,9 +1066,11 @@ stk_row_init(StkRow *self)
   gtk_box_append(GTK_BOX(names), self->name_label);
   gtk_box_append(GTK_BOX(self), names);
 
-  self->spark = stk_sparkline_new();
-  gtk_widget_set_valign(self->spark, GTK_ALIGN_CENTER);
-  gtk_box_append(GTK_BOX(self), self->spark);
+  self->range_label = make_label("stk-range", 0.5f);
+  gtk_label_set_width_chars(GTK_LABEL(self->range_label), 3);
+  gtk_widget_set_valign(self->range_label, GTK_ALIGN_CENTER);
+  gtk_widget_set_visible(self->range_label, FALSE);
+  gtk_box_append(GTK_BOX(self), self->range_label);
 
   self->price_label = make_label("stk-price", 1.0f);
   gtk_label_set_width_chars(GTK_LABEL(self->price_label), 7);

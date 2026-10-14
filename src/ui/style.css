@@ -1,5 +1,5 @@
 /* Style of the stocks main window (loaded by StkApp at start-up). The chart
- * and sparkline colour themselves (stk-chart.h); only the rest is styled here. */
+ * colours itself (stk-chart.h); only the rest is styled here. */
 
 .stk-row {
   padding: 8px 12px;
@@ -12,6 +12,15 @@
 .stk-row .stk-name {
   font-size: 0.85em;
   opacity: 0.65;
+}
+
+/* Chart range of the row (1D, 1M, ...): a neutral pill that follows the theme. */
+.stk-range {
+  font-size: 0.8em;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: alpha(currentColor, 0.12);
 }
 
 .stk-price,
@@ -38,8 +47,7 @@
 
 /* Cached data after a failed refresh. */
 .stk-row.stale .stk-price,
-.stk-row.stale .stk-change,
-.stk-row.stale stk-sparkline {
+.stk-row.stale .stk-change {
   opacity: 0.55;
 }
 
